@@ -1,0 +1,23 @@
+# server-log-to-stdout.cli
+#   【恒久対策】server.log というファイル自体をやめ、JSON で stdout に出す。
+#   stdout は ECS の awslogs / FireLens(Fluent Bit) が拾うので、ファイルも FD も rename も存在しなくなる。
+#   （本資料 9.1 の「案1」を JBoss に適用したもの。EAP 7.1 以降の json-formatter を使用）
+#
+#     $JBOSS_HOME/bin/jboss-cli.sh --file=server-log-to-stdout.cli
+
+embed-server --server-config=standalone.xml --std-out=discard
+
+batch
+/subsystem=logging/json-formatter=JSON:add(exception-output-type=formatted, date-format="yyyy-MM-dd'T'HH:mm:ss.SSSXXX", zone-id="Asia/Tokyo")
+/subsystem=logging/console-handler=CONSOLE:write-attribute(name=named-formatter, value=JSON)
+/subsystem=logging/console-handler=CONSOLE:write-attribute(name=level, value=ALL)
+/subsystem=logging/root-logger=ROOT:remove-handler(name=FILE)
+run-batch
+
+# FILE ハンドラ自体を残しておくと、どこかのロガーが参照していた場合に server.log が作られ続ける。
+# 参照が無いことを確認できたら削除する。
+if (outcome == success) of /subsystem=logging/periodic-rotating-file-handler=FILE:read-resource
+    /subsystem=logging/periodic-rotating-file-handler=FILE:remove
+end-if
+
+stop-embedded-server

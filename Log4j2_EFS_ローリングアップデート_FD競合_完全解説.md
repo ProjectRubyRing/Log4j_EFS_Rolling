@@ -1,7 +1,7 @@
 # Log4j2 × Amazon EFS × ECS ローリングアップデート
 ## ローテーション前ファイルの FD を掴み続ける問題 — 完全解説
 
-作成日: 2026-09-18
+作成日: 2026-09-18 ／ 追記: 2026-09-24（第16章：JBoss EAP の server.log）
 対象読者: アプリ開発者 / SRE / インフラ担当（付録の「小学生向け」章は前提知識なしで読めます）
 
 ---
@@ -11,6 +11,8 @@
 1. **起こります。** 新タスクがローテーション前の inode を掴んだまま生き残り、最大で1ロール周期（このケースでは1時間）ぶんのログを「回転済みファイル」の中に書き続ける状態は、構造上ふつうに発生します。
 2. **しかしそれは二次的な問題です。** そもそも「2タスクが EFS 上の同一ファイルを同時に開いて追記する」時点で、NFS では `O_APPEND` が原子的でないため、**デプロイのたびに100%の確率**でログの上書き・欠損が起きています。
 3. **根治策は1つだけ：同じパスを2つのプロセスに書かせないこと。** 最短の実装は「ログを stdout に出して FireLens/awslogs で送る」か、「`fileName` を書かない（DirectWrite）＋ パスにタスクIDを入れる」です。これで rename も共有も消滅し、全シナリオが同時に解決します。
+
+> **2026-09-24 追記：** JBoss EAP の `server.log` が「日付をまたいだ後も `server.log.<前日>` に追記され続ける」事象は、タスクIDディレクトリでは防げません。犯人が**同じタスクの内側**（同じ `server.log` を開く2つ目のハンドラ、stdout のリダイレクト）か、**`server.log` を外から rename する仕組み**だからです。詳細・再現・対策は **第16章** を参照してください。
 
 ---
 
@@ -1022,6 +1024,452 @@ EFS の登場で、「コンテナから POSIX 共有ファイルシステムを
 
 ---
 
+## 16. 追加検討：JBoss EAP の server.log が「前日付ファイル」に追記され続ける問題（2026-09-24 追記）
+
+> この章は、アプリログ（Log4j2）とは別に観測された **JBoss EAP の `server.log` の事象**を扱います。
+> 実装（再現プログラム・診断スクリプト・CLI・entrypoint）はリポジトリの `jboss/` 配下にあります（16.9 節）。
+
+### 16.0 3行でわかる結論
+
+1. **「`server.log.2026-09-18` に日付をまたいだ後のログが追記され、`server.log` に書かれない」は、「日付が変わる前に `server.log` を開いた FD が、回転後も生き残っている」ことの証拠です。** JBoss は日付付きの名前でファイルを開くことがないので、ほかの説明はありません（16.2）。
+2. **タスクIDディレクトリで防げるのは「別タスク（別ホスト）どうしの共有」だけです。** 今回の犯人は**同じタスク（同じ JVM／同じコンテナ）の内側**か、**`server.log` を外から rename する別の仕組み**です。ディレクトリをいくら細かく分けても、その**同じディレクトリの中**で起きるので防げません（16.3）。
+3. **JBoss 側に必要な対応は「`server.log` を開くのも rename するのも FILE ハンドラ1つだけにすること」です。** 具体的には (1) 同じ `server.log` を指す2つ目のハンドラ／デプロイメント内ログ設定を消す、(2) entrypoint で stdout を `server.log` にリダイレクトしない、(3) logrotate や収集バッチに `server.log` を rename させない、の3点です。恒久策は `server.log` をやめて JSON で stdout へ出すことです（16.8）。
+
+JBoss が実際に使っているロギングライブラリ（jboss-logmanager 2.1.19.Final、EAP 7.4 系と同じ系列）で再現したところ、原因候補1と原因候補3a が**ご報告の症状と完全に一致**しました。しかも両方とも**前日分のログが消えます**（16.6）。
+
+---
+
+### 16.1 観測されている事象の整理
+
+| 項目 | 内容 |
+|---|---|
+| 対象 | JBoss EAP の `server.log`（logging サブシステムの `periodic-rotating-file-handler`、`suffix=".yyyy-MM-dd"`） |
+| 出力先 | EFS 上の `/<ルート>/<タスクID>/<front または back>/server.log` のように、**タスクとコンテナごとにディレクトリを分けている** |
+| 期待する動き | 0時を過ぎて最初のログが出た瞬間に `server.log` → `server.log.2026-09-18` と rename され、以後は新しい `server.log` に書かれる |
+| 実際の動き | 0時を過ぎた後も **`server.log.2026-09-18` に追記され続け**、`server.log` には書かれない（または、ほとんど書かれない） |
+| アプリログとの違い | アプリログ（Log4j2）はタスクIDディレクトリで解消したが、**`server.log` は解消しない** |
+
+### 16.2 まず確定できること — 推理の出発点
+
+これは推測ではなく、**ファイルと FD の仕組みから必ずそうなる**という話です。
+
+1. JBoss の `periodic-rotating-file-handler` が `open()` するファイル名は、**いつでも `server.log`（`<file path=...>` に書いた名前）だけ**です。`server.log.2026-09-18` という名前で開くことは**一度もありません**。日付付きの名前は、回転のときに **rename の移動先**として使うだけです（16.4 のソース参照）。
+2. それなのに `server.log.2026-09-18` に**今日のログ**が増えている。
+3. 名前 `server.log.2026-09-18` で開いた人がいない以上、そのファイルに書ける方法は1つしかありません：
+   **「まだ `server.log` という名前だったときに開いた FD」を持ち続けている書き手がいる。**
+   （3.2 節のとおり、FD は名前ではなく inode に結びつくので、rename されても書き手は気づかずに書き続けます）
+4. JBoss の FILE ハンドラは、回転するときに**自分の FD を必ず閉じて開き直します**。したがって、その「古い FD を持ち続けている書き手」は、
+   - **FILE ハンドラ以外の書き手**（同じファイルを開いている2つ目のハンドラ、シェルのリダイレクトなど）か、
+   - **FILE ハンドラ自身だが、FILE ハンドラが回転した後に、別の誰かがもう一度 rename した**
+   のどちらかです。
+
+つまり問題は「JBoss の回転が壊れている」ことではなく、**`server.log` に対して、FILE ハンドラ以外の“開く人”か“rename する人”がいる**ことです。以下ではそれを「犯人」と呼びます。
+
+### 16.3 なぜタスクIDディレクトリを挟んでも防げないのか
+
+#### 16.3.1 タスクIDディレクトリが保証しているもの・していないもの
+
+```
+                           ┌──────────── EFS ────────────┐
+                           │ /logs/<タスクA>/front/        │ ← タスクAだけが使う
+                           │ /logs/<タスクA>/back/         │
+                           │ /logs/<タスクB>/front/        │ ← タスクBだけが使う
+                           │ /logs/<タスクB>/back/         │
+                           └──────────────────────────────┘
+
+   タスクIDディレクトリが防ぐもの：タスクA と タスクB が同じファイルを開くこと（＝アプリログで起きていた問題）
+   タスクIDディレクトリが防げないもの：
+       ・タスクA の JVM の中で、2つの部品が同じ server.log を開くこと           ← 原因候補1
+       ・タスクA のコンテナの中で、シェルと JVM が同じ server.log を開くこと      ← 原因候補2
+       ・誰かが「/logs/<タスクA>/front/server.log」を名指しで rename すること    ← 原因候補3
+```
+
+ディレクトリを分けることは「**ほかのタスク**が入ってこないように、部屋を分ける」ことです。でも今回の犯人は、**同じ部屋の中にもともといる**か、**部屋の場所を知っていて外から入ってくる**ので、部屋を分けても意味がありません。
+
+#### 16.3.2 アプリログ（Log4j2）と server.log（JBoss）の比較
+
+| 観点 | アプリログ（Log4j2 `RollingFileAppender`） | server.log（jboss-logmanager `PeriodicRotatingFileHandler`） |
+|---|---|---|
+| 回転のきっかけ | 時刻を過ぎて最初のログイベント | **同じ**（時刻を過ぎて最初のログレコード。タイマーは無い） |
+| 回転の手順 | close → rename → create | **同じ**（close → `Files.move(…, REPLACE_EXISTING)` → create） |
+| 回転先が既にあるとき | 黙って上書き | **同じ**（`REPLACE_EXISTING` で黙って上書き） |
+| rename しない方式 | **ある**（`fileName` を書かない DirectWrite） | **無い**。必ず固定名 `server.log` に書き、回転時に rename する |
+| 外から rename されたら開き直すか | しない | **しない**（logrotate の `postrotate` で知らせる仕組みも無い） |
+| 以前の問題の「2人目の書き手」 | **別タスク**（別ホスト＝別の NFS クライアント） | **同じタスクの中**の別の FD、または**外部の rename** |
+| タスクIDディレクトリの効果 | **根治**（2人目の書き手が消える） | **効果なし**（2人目は同じディレクトリの中にいる） |
+| 起きるタイミング | デプロイと時境界が重なったとき（**確率的**） | 犯人がいる限り**毎日必ず**（デプロイと無関係） |
+| 前日分のログ | 上書きで消えることがある（シナリオD） | **原因候補1・3では毎日消える**（16.6） |
+
+**判別のヒント：** デプロイしなかった日にも毎日起きているなら、ローリングアップデートとは無関係で、**タスク内部に犯人がいる**ことがほぼ確定します。
+
+### 16.4 JBoss の回転処理の中身（jboss-logmanager のソースで確認）
+
+JBoss EAP 7.4 系が同梱する jboss-logmanager 2.1 系の `PeriodicRotatingFileHandler` の該当部分です（コメントは本資料で追加）。
+
+```java
+// ログ1件ごとに、書く前に呼ばれる
+protected void preWrite(final ExtLogRecord record) {
+    final long recordMillis = record.getMillis();
+    if (recordMillis >= nextRollover) {      // ★ 時刻を過ぎて「最初のレコード」が来たら回転（タイマーではない）
+        rollOver();
+        calcNextRollover(recordMillis);
+    }
+}
+
+private void rollOver() {
+    final File file = getFile();                           // いつでも server.log
+    // first, close the original file (some OSes won't let you move/rename a file that is open)
+    setFileInternal(null);                                 // ★ 自分の FD だけを閉じる（他人の FD は知らない）
+    // next, rotate it
+    suffixRotator.rotate(errorManager, file.toPath(), nextSuffix);   // ★ server.log → server.log.2026-09-18
+    // start new file
+    setFileInternal(file);                                 // ★ server.log を new FileOutputStream(file, append) で開き直す
+}
+```
+
+```java
+// SuffixRotator（圧縮なしの場合）
+Files.move(src, target, StandardCopyOption.REPLACE_EXISTING);   // ★ 移動先が既にあっても黙って上書き
+// 失敗しても例外は投げず、ErrorManager（stderr）に "Failed to move file ..." と出すだけ
+```
+
+ここから分かる、今回の事象に効いてくる性質は6つです。
+
+| # | 性質 | 今回への影響 |
+|---|---|---|
+| 1 | 回転は**タイマーではなく次のログレコード**で起きる | 0:00:00 ちょうどではなく「0時を過ぎて最初のログ」のとき。ハンドラごとに別々に判定する |
+| 2 | 回転で閉じるのは**自分の FD だけ** | 同じファイルを開いている**別のハンドラ・別のプロセスの FD は閉じない**。そちらは rename 後の日付ファイルに書き続ける |
+| 3 | 回転先は **`REPLACE_EXISTING`（上書き）** | 2人目が回転すると、1人目が作った `server.log.2026-09-18`（＝前日分）を**黙って消す** |
+| 4 | 開くのは**いつも `server.log`** | 日付ファイルに書かれている＝古い FD が残っている、と断定できる（16.2） |
+| 5 | **外から rename されても開き直さない** | logrotate 等が rename すると、JBoss は日付ファイルに書き続ける |
+| 6 | 日付の切り替わりは **JVM のタイムゾーン**（ハンドラの `timeZone`、既定は JVM 既定）で判定 | コンテナが UTC のままだと、回転は日本時間 **09:00** になる |
+
+また、`rename` 失敗時の挙動にも注意します。**rename に失敗した場合、JBoss は同じ `server.log` を開き直す**ので、ログは `server.log` に書かれ続けます。したがって **「rename 失敗」は今回の症状（日付ファイルに書かれる）とは逆の症状**になり、原因ではありません。
+
+### 16.5 原因候補 — 犯人は誰か
+
+| ID | 犯人 | よくある実例 | 症状の一致度 | 前日分のログ | 判別方法 |
+|---|---|---|---|---|---|
+| **1** | **同じ JVM の中の、FILE 以外のハンドラ／アペンダ** | CLI で追加した別名ハンドラ、`logging-profile`、WAR/EAR 内の `logging.properties`・`jboss-logging.properties`・`log4j.xml`・`log4j2.xml` が `${jboss.server.log.dir}/server.log` を指している | **完全一致**（再現済み） | **毎日消える** | JVM の FD のうち `server.log*` を指すものが**2本以上** |
+| **2** | **シェルのリダイレクト**（JVM の stdout/stderr） | entrypoint で `standalone.sh >> server.log 2>&1`、`\| tee -a server.log` | 部分一致（`server.log` 側も伸びる） | 残る | FD **1 / 2** が `server.log*` を指す |
+| **3a** | **外部の rename（JBoss の回転の“後”）** | コンテナ内の logrotate（`/etc/logrotate.d`）、収集用 EC2 の cron、S3 退避バッチが `mv server.log server.log.<日付>` | **完全一致**（再現済み） | **消える** | JVM の FD は1本だけなのに、**日付ファイルを指している** |
+| 3b | 外部の rename（JBoss の回転の“前”） | 同上で、実行が 0:00:00 直後 | 不一致（`server.log` に書かれる） | **消える**（日付ファイルが空になる） | 日付ファイルが空／極端に小さい |
+| 4 | タイムゾーンの不一致（見かけ上の類似） | コンテナの TZ が UTC のまま | 見かけ上一致（後から見ると日付ファイルに 0〜9時のログがある） | 残る | 0〜9時の間に `server.log` が伸びているか。`date` と `-Duser.timezone` |
+| 除外 | rename の失敗 | EFS の一時的なエラー | **逆の症状**（`server.log` に書かれ続ける） | 残る | stderr の `Failed to move file` |
+| 除外 | 別タスクとの共有 | — | タスクIDディレクトリで解消済み | — | — |
+
+以下、1つずつ詳しく見ます。
+
+#### 16.5.1 原因候補1：同じ JVM の中に `server.log` を開くハンドラが2つある（最有力）
+
+**どこに潜んでいるか**
+
+- **logging サブシステムに、FILE とは別名で同じ `path="server.log"` を指すハンドラ**がある
+  （例：障害調査のために CLI で `periodic-rotating-file-handler=APP_FILE` を追加し、出力先をうっかり `server.log` にした）
+- **`logging-profile`** の中のハンドラが `server.log` を指している
+- **デプロイメント（WAR/EAR）に同梱したログ設定ファイル**が `${jboss.server.log.dir}/server.log` を指している
+  - `WEB-INF/classes/logging.properties`、`META-INF/jboss-logging.properties`
+  - `log4j.xml` / `log4j.properties`（log4j 1.x の `DailyRollingFileAppender`）
+  - `log4j2.xml`（Log4j2 の `RollingFile`）
+  - JBoss は既定で `use-deployment-logging-config=true` なので、これらは**自動で有効**になり、**JBoss の FILE とは別のハンドラ（別の FD）**が作られる
+  - 特に log4j 1.x の `DailyRollingFileAppender` の既定の日付パターンは `'.'yyyy-MM-dd` で、**JBoss と全く同じ `server.log.2026-09-18` という名前**になるため、見分けがつきません
+
+**何が起きるか（ミリ秒単位）**
+
+同じロガーに FILE → APP_FILE の順でハンドラが付いている場合です。`#1` `#2` `#3` は inode 番号です。
+
+```
+時刻           FILE ハンドラ                          APP_FILE ハンドラ                      EFS 上の名前
+─────────────────────────────────────────────────────────────────────────────────────────────────────────
+（起動時）     open("server.log") → #1                open("server.log") → #1               server.log → #1
+23:59:50       write(#1)                              write(#1)                              server.log → #1（前日分が溜まる）
+00:00:00       （時境界。誰も何もしない）
+00:00:10.000   ★最初のレコードで回転開始
+00:00:10.001   close(#1)
+00:00:10.002   rename server.log → server.log.2026-09-18                                      server.log.2026-09-18 → #1
+00:00:10.003   open("server.log") → #2（新規）                                                server.log → #2
+00:00:10.004   write(#2)
+00:00:10.005                                          ★同じレコードで回転開始
+00:00:10.006                                          close(#1)                              （#1 を開いている人がいなくなる）
+00:00:10.007                                          rename server.log → server.log.2026-09-18
+                                                      ＝ #2 を 2026-09-18 という名前にし、   server.log.2026-09-18 → #2
+                                                        既存の #1 を上書きで削除 ★前日分消失   #1 は消滅
+00:00:10.008                                          open("server.log") → #3（新規）         server.log → #3
+00:00:10.009                                          write(#3)
+─────────────────────────────────────────────────────────────────────────────────────────────────────────
+以後 1日中     write(#2) → 名前は server.log.2026-09-18   write(#3) → 名前は server.log
+```
+
+**結果**
+
+- FILE ハンドラ（＝ふつうは全部のログを受ける本体）は、**1日中 `server.log.2026-09-18` に書き続けます**。← ご報告の症状そのもの
+- `server.log` には APP_FILE ハンドラの分しか書かれません。APP_FILE が一部のカテゴリ専用なら、`server.log` は**ほとんど空**に見えます。
+- **前日（9/18）のログは全部消えています。** `server.log.2026-09-18` の中身は、実は **9/19 のログ**です。
+- 翌日 0時にも同じことが繰り返され、`server.log.2026-09-19` には 9/20 のログが入り、APP_FILE が書いた 9/19 分は消えます。**ファイル名が毎日1日ずれ、毎日1つ分のログが消えます**（16.6 で再現済み）。
+- どちらのハンドラが先に回転するか（ロガーへの登録順、またはどちらのカテゴリに先にログが来るか）で、「日付ファイルに書き続けるのはどちらか」が入れ替わりますが、**症状の形は同じ**です。
+
+#### 16.5.2 原因候補2：entrypoint で stdout を `server.log` にリダイレクトしている
+
+```sh
+# よくある書き方（NG）
+exec $JBOSS_HOME/bin/standalone.sh -b 0.0.0.0 >> "$LOG_DIR/server.log" 2>&1
+```
+
+- `>>` を処理するのは**シェル**です。シェルが JVM 起動前に `server.log` を開き、その FD を JVM の FD 1（stdout）・FD 2（stderr）として渡します。**この FD は JVM が終わるまで閉じられません。**
+- JBoss の **CONSOLE ハンドラ**（既定で INFO 以上を全部出す）と、アプリの `System.out.println`、JVM のエラー出力は、**すべてこの FD に書かれます**。
+- 0時に FILE ハンドラが回転すると、FD 1/2 は **`server.log.2026-09-18` を指したまま**になり、CONSOLE の出力が日付ファイルに書かれ続けます。
+- 一方 FILE ハンドラは新しい `server.log` に書くので、**`server.log` も伸びます**。ご報告の「`server.log` に書かれない」とは部分的に異なりますが、FILE ハンドラのレベルやカテゴリを絞っている構成では、ほぼ同じ見え方になります。
+- さらに、同じ内容が2つのファイルに二重に出るため、容量も2倍になります。
+
+#### 16.5.3 原因候補3：JBoss 以外の何かが `server.log` を rename している
+
+- VM 時代の設計を引き継いだイメージに入っている **logrotate**（`/etc/logrotate.d/jboss` など。`dateext` と `dateformat .%Y-%m-%d` を使うと、JBoss と同じ名前になる）
+- ログ収集用の EC2 から EFS をマウントし、**cron で `server.log` を日付名へ `mv`** しているバッチ
+- 「前日分を S3 に退避する」運用手順やスクリプトが `server.log` そのものを動かしている
+
+**JBoss の回転の“後”に外部が rename した場合（3a：ご報告の症状と一致）**
+
+```
+00:00:10  JBoss が回転： server.log(#1) → server.log.2026-09-18、新しい server.log(#2) を開く
+00:00:30  外部が      ： mv server.log(#2) server.log.2026-09-18  ← #1（前日分）を上書きで削除
+                        touch server.log(#3)（logrotate の create 相当）
+以後      JBoss は #2（名前は server.log.2026-09-18）に書き続ける。server.log(#3) は空のまま
+```
+
+**JBoss の回転の“前”に外部が rename した場合（3b）**
+
+```
+00:00:01  外部が      ： mv server.log(#1) server.log.2026-09-18、touch server.log(#2)
+00:00:10  JBoss が回転： close(#1)、mv server.log(#2・空) server.log.2026-09-18 ← #1（前日分）を上書きで削除
+                        新しい server.log(#3) を開く
+以後      JBoss は server.log(#3) に書く。server.log.2026-09-18 は空
+```
+
+どちらの順番でも**前日分は消えます**。どちらになるかは「0時を過ぎて最初のログが出る時刻」と「外部の処理が動く時刻」の前後で決まるため、日によって症状が変わることもあります。
+
+**別ホストから rename された場合の注意（EFS 特有）**
+
+rename したのが**別ホスト（別の NFS クライアント）**だと、JBoss 側のカーネルはそのことを知らないため、`ls -l /proc/<pid>/fd` の表示は **`server.log` のまま**のことがあります。**名前ではなく inode 番号で比較**してください（`check-server-log-fd.sh` は自動で比較します）。
+
+#### 16.5.4 原因候補4：タイムゾーンの不一致（見かけ上の類似）
+
+- コンテナの既定は UTC です。`TZ` と `-Duser.timezone` を設定していないと、JBoss の「日付が変わった」判定は **UTC の 0時＝日本時間 9時**になります。
+- すると、日本時間 9/19 の 0時〜9時のログは `server.log` に書かれ、9時に `server.log.2026-09-18` へ回転します。**後から見ると「前日付のファイルに今日の 0〜9時のログが入っている」**ので、ご報告の症状に似て見えます。
+- ただし、**0〜9時の間は `server.log` が伸びている**点が違います。「今まさに日付ファイルが伸びている」なら、この候補ではありません。
+- 単独では原因になりませんが、**他の候補と重なると症状の読み取りを誤らせる**ので、あわせて直します。
+
+#### 16.5.5 原因ではないもの
+
+| 候補 | 原因ではない理由 |
+|---|---|
+| rename の失敗（EFS の一時エラーなど） | 失敗すると JBoss は同じ `server.log` を開き直すので、ログは `server.log` に書かれ続ける。**症状が逆** |
+| 別タスクとの共有 | タスクIDディレクトリで分離済み。別タスクは同じパスを開けない |
+| front と back コンテナの共有 | ディレクトリで分離済み（同じディレクトリを指していないか、念のため 16.7 の手順で確認） |
+| EFS の性能・スループットモード | rename と create の間の数ミリ秒が変わるだけで、FD の行き先は変わらない |
+| JBoss のバグ | JBoss は「自分の FD を閉じて開き直す」を正しく行っている。**同じファイルを他人と共有する使い方を想定していない**だけ |
+
+### 16.6 実物のライブラリでの再現結果
+
+`jboss/repro/ServerLogRotationRepro.java` は、**JBoss EAP が実際に使っている jboss-logmanager の `PeriodicRotatingFileHandler` そのもの**を使い、ログの時刻を 9/18 23:59 → 9/19 0:00 に設定して日付またぎを起こします（`jboss/repro/run_repro.sh` で実行。JBoss 本体は不要）。2026-09-24 に jboss-logmanager 2.1.19.Final で実行した結果の要点です（全文は `jboss/repro/expected_output.txt`）。
+
+| シナリオ | 回転後に FD が指している先 | `server.log` の中身 | `server.log.2026-09-18` の中身 | 判定 |
+|---|---|---|---|---|
+| S0 正常系（FILE 1つだけ） | fd 8 → `server.log` | 9/19 のログ | 9/18 のログ | 正常 |
+| **S1 同一JVMに2ハンドラ** | fd 8 → **`server.log.2026-09-18`**、fd 9 → `server.log` | APP_FILE の 9/19 分だけ | **FILE の 9/19 分**（9/18 分は**消滅**） | **症状と一致** |
+| S1 の翌日 | fd 8 → **`server.log.2026-09-19`** | APP_FILE の 9/20 分だけ | （`…-09-19` に FILE の 9/20 分、APP_FILE の 9/19 分は**消滅**） | 毎日繰り返す |
+| S2 外部 rename（JBoss の後） | fd 8 → **`server.log.2026-09-18`** | **空** | **9/19 のログ**（9/18 分は**消滅**） | **症状と一致** |
+| S3 外部 rename（JBoss の前） | fd 8 → `server.log` | 9/19 のログ | **空**（9/18 分は**消滅**） | 前日分だけ消える |
+| S4 stdout リダイレクト | fd 8 → `server.log.2026-09-18`（シェルの FD）、fd 9 → `server.log` | FILE の 9/19 分 | 9/18 分 ＋ **CONSOLE の 9/19 分** | 部分一致 |
+| S5 JVM が UTC | fd 8 → `server.log` | JST 9:00 以降 | 9/18 分 ＋ **JST 9/19 0〜9時** | 見かけ上一致 |
+
+S1 の実際の出力（抜粋）：
+
+```
+  ■ この JVM が開いている FD（/proc/self/fd）
+    fd 8 -> server.log.2026-09-18
+    fd 9 -> server.log
+    ※ FILE ハンドラ自身は getFile()=server.log に書いているつもり
+    ※ APP_FILE ハンドラ自身は getFile()=server.log に書いているつもり
+
+  ■ ディレクトリの状態と中身
+    server.log
+        APP_FILE | 2026-09-19 00:00:10 9/19 最初のログ ← ここで FILE が回転し、直後に APP_FILE も回転
+        APP_FILE | 2026-09-19 00:00:40 9/19 2件目のログ
+        APP_FILE | 2026-09-19 12:00:00 9/19 昼のログ
+    server.log.2026-09-18
+        FILE     | 2026-09-19 00:00:10 9/19 最初のログ ← ここで FILE が回転し、直後に APP_FILE も回転
+        FILE     | 2026-09-19 00:00:40 9/19 2件目のログ
+        FILE     | 2026-09-19 12:00:00 9/19 昼のログ
+```
+
+**ハンドラ自身は「`server.log` に書いているつもり」（`getFile()` は `server.log` を返す）なのに、実際の FD は `server.log.2026-09-18` を指している**ことが分かります。JBoss の管理 CLI でハンドラ設定を見ても異常は見えず、**FD を見て初めて分かる**種類の問題です。
+
+### 16.7 切り分け手順
+
+コンテナに入り（ECS Exec 等）、**日付をまたいだ後**に次を実行します。なお、原因候補1・2 は「`server.log` を指す FD が2本以上ある」状態なので、**日付をまたぐ前でも検出できます**（日中に実行して先に潰せます）。原因候補3 は日付をまたいだ後でないと見えません。
+
+```sh
+# 1. 実行時の FD を点検（原因候補を自動判定）
+<配置先>/check-server-log-fd.sh /mnt/efs/logs/<タスクID>/<front|back>
+
+# 2. 設定・デプロイメント・logrotate・entrypoint を点検（犯人の定義箇所を特定）
+<配置先>/audit-logging-config.sh --cli /entrypoint.sh
+```
+
+手で確認する場合：
+
+```sh
+PID=$(pgrep -f 'jboss-modules.jar' | head -1)
+ls -l /proc/$PID/fd | grep 'server\.log'          # server.log* を指す FD の本数と番号を見る
+stat -c '%i %n' /mnt/efs/logs/<タスクID>/<コンテナ>/server.log*
+for f in $(ls /proc/$PID/fd); do
+  t=$(readlink /proc/$PID/fd/$f); case "$t" in *server.log*) echo "fd $f inode=$(stat -L -c %i /proc/$PID/fd/$f) $t";; esac
+done
+```
+
+```
+                    server.log* を指す FD を数える（ls -l /proc/<pid>/fd）
+                                        │
+         ┌──────────────────────────────┼───────────────────────────────┐
+     FD 1 / 2 がある                JVM 内に 2本以上                   1本だけ
+         │                              │                               │
+         ▼                              ▼                               ▼
+   【原因候補2】                   【原因候補1】             その1本が日付ファイル（または inode 不一致）？
+   entrypoint の                   audit-logging-config.sh           ┌──────────┴──────────┐
+   リダイレクトを外す              で2つ目のハンドラを特定         はい                  いいえ
+                                   （subsystem／profile／             │                     │
+                                     デプロイメント内設定）           ▼                     ▼
+                                                               【原因候補3】           正常（いまは発生していない）
+                                                               logrotate／収集バッチ    → 日付ファイルの中身が 0〜9時なら
+                                                               ／別ホストの cron        【原因候補4】タイムゾーン
+```
+
+### 16.8 JBoss 側で必要な対応
+
+原則は第8章と同じく「**1つのファイルを開くのも rename するのも、1つの書き手だけ**」です。アプリログではそれを「タスクごとにパスを分ける」で満たしましたが、`server.log` では**タスクの内側**で満たす必要があります。
+
+| # | 対応 | 対象の原因 | 効果 | 工数 | 実装 |
+|---|---|---|---|---|---|
+| J1 | **`server.log` を指すハンドラを FILE 1つだけにする**（2つ目は `app.log` 等へ向け直すか削除） | 候補1 | 根治 | 小 | `jboss/cli/fix-server-log-single-writer.cli` |
+| J2 | **デプロイメント内のログ設定を無効化**（`use-deployment-logging-config=false`）、またはアプリ側の出力先を `server.log` 以外へ変更 | 候補1 | 根治 | 小 | 同上 |
+| J3 | **entrypoint で stdout/stderr を `server.log` にリダイレクトしない**（stdout は ECS の awslogs / FireLens へ） | 候補2 | 根治 | 極小 | `jboss/bin/entrypoint.sh` |
+| J4 | **logrotate・収集バッチ・運用手順に `server.log` を触らせない**（触ってよいのは回転済みの `server.log.*` だけ、しかも1日以上前のもの） | 候補3 | 根治 | 小 | 運用手順・cron の修正 |
+| J5 | **`TZ=Asia/Tokyo` と `-Duser.timezone=Asia/Tokyo`** を設定 | 候補4 | 誤認防止 | 極小 | `jboss/bin/entrypoint.sh` |
+| J6 | **`JBOSS_LOG_DIR` と `-Djboss.server.log.dir` を同じにする**（起動時ログと本番ログの出力先をそろえる） | 予防 | 予防 | 極小 | `jboss/bin/entrypoint.sh` |
+| J7 | **監視**：`check-server-log-fd.sh` を日次（0:05 など）で実行し、終了コード 1 でアラート | 全部 | 検知 | 小 | `jboss/bin/check-server-log-fd.sh` |
+| **J8** | **【恒久策】`server.log` をやめ、JSON で stdout に出す**（CONSOLE ハンドラ＋`json-formatter`。EAP 7.1 以降） | 全部 | **根治**（ファイルも rename も無くなる） | 中 | `jboss/cli/server-log-to-stdout.cli` |
+
+**推奨の組み合わせ**
+
+```
+【すぐやる】 J7（まず診断を実行して犯人を特定）
+                 ↓
+【犯人に応じて】 候補1 → J1 ＋ J2 ／ 候補2 → J3 ／ 候補3 → J4
+                 ＋
+【併用】        J5（タイムゾーン）、J6（ログディレクトリの一致）
+                 ＋
+【恒久策】      J8（stdout ＋ FireLens／awslogs）。アプリログの案1とそろえると、収集経路が1本になる
+```
+
+**やっても効かないこと（念のため）**
+
+| 対策 | 効かない理由 |
+|---|---|
+| タスクIDディレクトリをさらに細かくする | 犯人は同じディレクトリの中にいる（16.3） |
+| `autoflush` を変える | 書き込むタイミングが変わるだけで、FD の行き先は変わらない |
+| `periodic-size-rotating-file-handler` や `size-rotating-file-handler` に替える | 回転の方式（close → rename → create）は同じ。2人目の書き手がいれば同じことが起きる |
+| `suffix` に `.gz` を付ける | 回転時に圧縮してから元ファイルを削除するので、2人目の書き手の FD は**削除済みファイル**（EFS では `.nfs*`）を指すことになり、**もっと悪化**する |
+| `async-handler` で FILE を包む | 非同期になるだけで、FD の本数は変わらない |
+| JBoss の再起動 | 一時的に直るが、翌日 0時に**また起きる** |
+
+### 16.9 実装（リポジトリ `jboss/` 配下）
+
+| ファイル | 役割 |
+|---|---|
+| `jboss/repro/ServerLogRotationRepro.java` | 実物の jboss-logmanager で原因候補1〜4を再現し、FD と各ファイルの中身を表示する |
+| `jboss/repro/run_repro.sh` | 上記に必要な jar を Maven Central から取得して実行する。引数に EFS 上のパスを渡せば EFS 上で再現できる |
+| `jboss/repro/expected_output.txt` | 2026-09-24 に実行した結果（本章 16.6 の根拠） |
+| `jboss/bin/check-server-log-fd.sh` | **実行時診断**。`/proc/*/fd` を調べ、`server.log*` を指す FD の本数・番号・inode から原因候補を自動判定する（終了コード 0=正常 / 1=異常） |
+| `jboss/bin/audit-logging-config.sh` | **静的点検**。`standalone.xml`（logging-profile 含む）・`logging.properties`・デプロイメント内のログ設定・logrotate/cron・entrypoint を横断し、`server.log` を開く／rename する主体を列挙する |
+| `jboss/cli/fix-server-log-single-writer.cli` | J1・J2：FILE を唯一の `server.log` ハンドラにし、2つ目を別ファイルへ向け直し、デプロイメント内ログ設定を無効化する |
+| `jboss/cli/server-log-to-stdout.cli` | J8：`server.log` をやめて JSON で stdout に出す |
+| `jboss/bin/entrypoint.sh` | J3・J5・J6：タスクID／コンテナ名のディレクトリを作り、リダイレクトせずに `exec standalone.sh` する |
+
+**entrypoint の要点**
+
+```sh
+JBOSS_LOG_DIR="${EFS_LOG_ROOT}/${ECS_TASK_ID}/${CONTAINER_ROLE}"   # 例: /mnt/efs/logs/<タスクID>/front
+export JBOSS_LOG_DIR                                               # 起動時ログ（org.jboss.boot.log.file）の場所
+export TZ=Asia/Tokyo
+JAVA_OPTS="${JAVA_OPTS:-} -Duser.timezone=${TZ}"
+
+# ★ >> server.log や | tee を付けない。stdout は ECS のログドライバへそのまま渡す
+exec "$JBOSS_HOME/bin/standalone.sh" -b 0.0.0.0 -Djboss.server.log.dir="$JBOSS_LOG_DIR" "$@"
+```
+
+**CLI の要点**
+
+```
+# FILE を唯一の server.log ハンドラとして明示
+/subsystem=logging/periodic-rotating-file-handler=FILE:write-attribute(name=file, value={relative-to=jboss.server.log.dir, path=server.log})
+
+# 2つ目のハンドラ（例: APP_FILE）は別ファイルへ向け直す
+/subsystem=logging/periodic-rotating-file-handler=APP_FILE:write-attribute(name=file, value={relative-to=jboss.server.log.dir, path=app.log})
+
+# WAR/EAR 同梱の logging.properties / log4j.xml / log4j2.xml を無視させる
+/subsystem=logging:write-attribute(name=use-deployment-logging-config, value=false)
+```
+
+> `use-deployment-logging-config=false` にすると、アプリが同梱しているログ設定がすべて無視されます。アプリがその設定に依存している（独自のファイルに出している）場合は、この設定ではなく**アプリ側の出力先を `server.log` 以外に変える**方を選んでください。その場合、アプリ側のファイルは第9章の案2（DirectWrite ＋ タスクID別パス）で書くのが安全です。
+
+### 16.10 たとえ話（小学生向け）
+
+1.1 節の「ノートと名前シール」の続きです。今回は、**たろうくん専用の部屋**（＝タスクIDのディレクトリ）を用意したので、ほかのクラスの子は入ってきません。それなのに、まだノートがおかしくなります。
+
+- 部屋の中には、**たろうくん（FILE ハンドラ）** と、**たろうくんのふたご（2つ目のハンドラ）** がいて、**2人とも「たろうのノート」の整理券を持っていた**のです（原因候補1）。
+- 夜12時、たろうくんがノートを閉じて、シールを「9月18日ぶん」に貼り替え、新しいノートに「たろうのノート」のシールを貼りました。
+- すぐあとに、ふたごも同じことをしました。ふたごは**たろうくんが今使いはじめた新しいノート**のシールを「9月18日ぶん」に貼り替えて、**本物の 9月18日ぶんのノートを捨ててしまいました**（上書き）。
+- たろうくんは、自分の新しいノートに「9月18日ぶん」のシールが貼られたことに気づかず、**1日中そこに書き続けます**。
+
+別の部屋から来た人がいたわけではないので、**部屋を分けても防げません**。直し方は「**1冊のノートの整理券を持てるのは1人だけ、シールを貼り替えてよいのもその1人だけ**」と決めることです。
+
+- ふたごには別のノート（`app.log`）を渡す（J1・J2）
+- 部屋の入口で「ノートにも同じことを書いておいて」と頼む係（シェルのリダイレクト）をやめる（J3）
+- 夜中にシールを勝手に貼り替えにくる用務員さん（logrotate・収集バッチ）に、「たろうのノート」には触らないでもらう（J4）
+
+### 16.11 チェックリスト
+
+**今すぐ確認すること**
+
+- [ ] 0時を過ぎたあと、`check-server-log-fd.sh` を実行して判定を記録した
+- [ ] JVM の FD のうち `server.log*` を指すものが **1本だけ**か（2本以上なら原因候補1）
+- [ ] FD 1 / 2 が `server.log*` を指していないか（指していれば原因候補2）
+- [ ] FD が1本だけで日付ファイル（または inode 不一致）を指していないか（指していれば原因候補3）
+- [ ] `server.log.<日付>` の**最初の行の日付**が、ファイル名の日付と一致しているか（1日ずれていれば前日分が消えている）
+- [ ] `standalone.xml` と logging-profile に、`server.log` を指すハンドラが FILE 以外にないか
+- [ ] WAR/EAR に `logging.properties`・`jboss-logging.properties`・`log4j.xml`・`log4j2.xml` が同梱されていないか、同梱されていれば `server.log` を指していないか
+- [ ] コンテナ内の `/etc/logrotate.d`・cron、収集用 EC2 の cron、運用手順に `server.log` の rename が無いか
+- [ ] entrypoint に `>> server.log` や `| tee` が無いか
+- [ ] コンテナの `date` と JVM の `user.timezone` が JST か
+
+**対策の実施**
+
+- [ ] 犯人に応じて J1〜J4 を実施
+- [ ] J5（TZ）と J6（ログディレクトリの一致）を実施
+- [ ] ステージングで 0時をまたいで稼働させ、`check-server-log-fd.sh` が「正常」になることを確認
+- [ ] 本番適用後、`check-server-log-fd.sh` を日次監視に組み込む（J7）
+- [ ] 恒久策 J8（stdout ＋ FireLens／awslogs）の採否を、アプリログの案1とあわせて決める
+
+### 16.12 要確認事項
+
+1. **jboss-logmanager のバージョン**：本章は EAP 7.4 系と同じ 2.1 系（2.1.19.Final）のソースと実行結果に基づきます。EAP 7.0〜7.3（2.0 系）・EAP 8（3.x 系）も回転の手順（close → move → open）は同じ設計ですが、実環境のバージョンで `run_repro.sh` の `LOGMANAGER_VERSION` を合わせて確認してください。EAP 6 系（1.5 系）は `File.renameTo` を使いますが、Linux では移動先を上書きする点は同じです。
+2. **ハンドラの呼び出し順**：同じロガーに複数ハンドラがある場合の順序は登録順です。どちらが日付ファイルに書き続けるかは順序で変わりますが、症状の形（片方が日付ファイル、前日分が消える）は変わりません。
+3. **`/deployment=*/subsystem=logging/configuration=*`**（`audit-logging-config.sh --cli` で使用）は EAP 7 系の実行時リソースです。EAP 6 系では存在しないため、静的点検（アーカイブの中身の点検）で代替してください。
+4. **別ホストからの rename** のとき `/proc/<pid>/fd` の表示名が更新されるかどうかは、NFS クライアントのキャッシュ状態に依存します。**inode 番号での比較**を正としてください。
+5. **ECS のコンテナ間 PID 名前空間**：タスク定義で `pidMode: task` を設定していない場合、サイドカーコンテナが `server.log` を開いていても、JBoss コンテナの中からは見えません。サイドカー（Fluent Bit 等）がある場合は、そのコンテナの中でも `check-server-log-fd.sh` を実行してください（読むだけなら無害です）。
+
+---
+
 ## 付録A：「なぜ書き込み間隔を短くすると安全になるのか」の直感的説明
 
 ロールオーバは**時計ではなく、次のログ出力**で起きます。
@@ -1082,4 +1530,4 @@ EFS の登場で、「コンテナから POSIX 共有ファイルシステムを
 
 ---
 
-*本資料は 2026-09-18 時点の理解に基づいて作成しました。「要確認」と記した箇所は、実環境のバージョンおよび実機での検証をお願いします。*
+*本資料は 2026-09-18 時点の理解に基づいて作成し、第16章を 2026-09-24 に追記しました。「要確認」と記した箇所は、実環境のバージョンおよび実機での検証をお願いします。*

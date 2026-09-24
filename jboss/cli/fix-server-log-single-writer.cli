@@ -1,0 +1,50 @@
+# fix-server-log-single-writer.cli
+#   server.log を「開く」のも「rename する」のも FILE ハンドラ1つだけにする。
+#
+#   イメージビルド時（オフライン）に適用する例:
+#     $JBOSS_HOME/bin/jboss-cli.sh --file=fix-server-log-single-writer.cli
+#   稼働中サーバーに適用する場合は、先頭の embed-server と末尾の stop-embedded-server を消して
+#     $JBOSS_HOME/bin/jboss-cli.sh --connect --file=fix-server-log-single-writer.cli
+#   を実行し、そのあと :reload してください（ハンドラの FD を確実に開き直すため）。
+#
+#   ★ APP_FILE は例です。audit-logging-config.sh が「同じファイルを複数のハンドラが開きます」と
+#     出したハンドラ名に置き換えてください（FILE 以外の全部が対象）。
+
+embed-server --server-config=standalone.xml --std-out=discard
+
+# ---------------------------------------------------------------------------------------------
+# 1) FILE ハンドラの定義を明示する（server.log を開いてよい唯一のハンドラ）
+#    suffix の %d 相当の最小単位（ここでは dd）が回転周期を決める。
+# ---------------------------------------------------------------------------------------------
+batch
+/subsystem=logging/periodic-rotating-file-handler=FILE:write-attribute(name=file, value={relative-to=jboss.server.log.dir, path=server.log})
+/subsystem=logging/periodic-rotating-file-handler=FILE:write-attribute(name=suffix, value=".yyyy-MM-dd")
+/subsystem=logging/periodic-rotating-file-handler=FILE:write-attribute(name=append, value=true)
+/subsystem=logging/periodic-rotating-file-handler=FILE:write-attribute(name=autoflush, value=true)
+run-batch
+
+# ---------------------------------------------------------------------------------------------
+# 2) server.log を指している FILE 以外のハンドラは、別ファイルへ向け直す（原因候補1の解消）
+#    削除ではなく向け直しにしているのは、ロガーからの参照を壊さずに済むため。
+#    ハンドラ自体が不要なら、参照しているロガーから remove-handler してから :remove でもよい。
+# ---------------------------------------------------------------------------------------------
+if (outcome == success) of /subsystem=logging/periodic-rotating-file-handler=APP_FILE:read-resource
+    /subsystem=logging/periodic-rotating-file-handler=APP_FILE:write-attribute(name=file, value={relative-to=jboss.server.log.dir, path=app.log})
+end-if
+
+# logging-profile の中に server.log を指すハンドラがある場合も同様に向け直す（プロファイル名・ハンドラ名は例）
+if (outcome == success) of /subsystem=logging/logging-profile=app/periodic-rotating-file-handler=FILE:read-resource
+    /subsystem=logging/logging-profile=app/periodic-rotating-file-handler=FILE:write-attribute(name=file, value={relative-to=jboss.server.log.dir, path=app-profile.log})
+end-if
+
+# ---------------------------------------------------------------------------------------------
+# 3) デプロイメント（WAR/EAR）に同梱された logging.properties / log4j.xml / log4j2.xml 等を無視させる
+#    これらが ${jboss.server.log.dir}/server.log を指していると、JBoss の FILE とは別の FD で
+#    server.log を開き、しかも独自に rename する（log4j 1.x DailyRollingFileAppender の既定サフィックスは
+#    '.'yyyy-MM-dd なので、JBoss と全く同じ server.log.YYYY-MM-DD という名前になる）。
+#    ★ アプリが自前のログ設定に依存している場合は、この設定ではなく、アプリ側の出力先を
+#      server.log 以外（app.log 等）へ変える方を選んでください。
+# ---------------------------------------------------------------------------------------------
+/subsystem=logging:write-attribute(name=use-deployment-logging-config, value=false)
+
+stop-embedded-server
