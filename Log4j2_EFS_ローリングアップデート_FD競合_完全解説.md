@@ -1,7 +1,7 @@
 # Log4j2 × Amazon EFS × ECS ローリングアップデート
 ## ローテーション前ファイルの FD を掴み続ける問題 — 完全解説
 
-作成日: 2026-09-18 ／ 追記: 2026-09-24（第16章：JBoss EAP の server.log）
+作成日: 2026-09-18 ／ 追記: 2026-09-24（第16章：JBoss EAP 8.1 の server.log）
 対象読者: アプリ開発者 / SRE / インフラ担当（付録の「小学生向け」章は前提知識なしで読めます）
 
 ---
@@ -12,7 +12,7 @@
 2. **しかしそれは二次的な問題です。** そもそも「2タスクが EFS 上の同一ファイルを同時に開いて追記する」時点で、NFS では `O_APPEND` が原子的でないため、**デプロイのたびに100%の確率**でログの上書き・欠損が起きています。
 3. **根治策は1つだけ：同じパスを2つのプロセスに書かせないこと。** 最短の実装は「ログを stdout に出して FireLens/awslogs で送る」か、「`fileName` を書かない（DirectWrite）＋ パスにタスクIDを入れる」です。これで rename も共有も消滅し、全シナリオが同時に解決します。
 
-> **2026-09-24 追記：** JBoss EAP の `server.log` が「日付をまたいだ後も `server.log.<前日>` に追記され続ける」事象は、タスクIDディレクトリでは防げません。犯人が**同じタスクの内側**（同じ `server.log` を開く2つ目のハンドラ、stdout のリダイレクト）か、**`server.log` を外から rename する仕組み**だからです。詳細・再現・対策は **第16章** を参照してください。
+> **2026-09-24 追記：** JBoss EAP 8.1 の `server.log` が「日付をまたいだ後も `server.log.<前日>` に追記され続ける」事象は、タスクIDディレクトリでは防げません。犯人が**同じタスクの内側**（同じ `server.log` を開く2つ目のハンドラ、アプリが同梱した reload4j 等のアペンダ、stdout のリダイレクト）か、**`server.log` を外から rename する仕組み**だからです。詳細・再現・対策は **第16章** を参照してください。
 
 ---
 
@@ -1024,18 +1024,19 @@ EFS の登場で、「コンテナから POSIX 共有ファイルシステムを
 
 ---
 
-## 16. 追加検討：JBoss EAP の server.log が「前日付ファイル」に追記され続ける問題（2026-09-24 追記）
+## 16. 追加検討：JBoss EAP 8.1 の server.log が「前日付ファイル」に追記され続ける問題（2026-09-24 追記・EAP 8.1 前提で再検討）
 
 > この章は、アプリログ（Log4j2）とは別に観測された **JBoss EAP の `server.log` の事象**を扱います。
 > 実装（再現プログラム・診断スクリプト・CLI・entrypoint）はリポジトリの `jboss/` 配下にあります（16.9 節）。
+> **対象は JBoss EAP 8.1** です。EAP 8.1 が実際に同梱しているライブラリのバージョンと、EAP 8 で変わったログ周りの仕様は 16.1.1 で確認しています。
 
 ### 16.0 3行でわかる結論
 
 1. **「`server.log.2026-09-18` に日付をまたいだ後のログが追記され、`server.log` に書かれない」は、「日付が変わる前に `server.log` を開いた FD が、回転後も生き残っている」ことの証拠です。** JBoss は日付付きの名前でファイルを開くことがないので、ほかの説明はありません（16.2）。
 2. **タスクIDディレクトリで防げるのは「別タスク（別ホスト）どうしの共有」だけです。** 今回の犯人は**同じタスク（同じ JVM／同じコンテナ）の内側**か、**`server.log` を外から rename する別の仕組み**です。ディレクトリをいくら細かく分けても、その**同じディレクトリの中**で起きるので防げません（16.3）。
-3. **JBoss 側に必要な対応は「`server.log` を開くのも rename するのも FILE ハンドラ1つだけにすること」です。** 具体的には (1) 同じ `server.log` を指す2つ目のハンドラ／デプロイメント内ログ設定を消す、(2) entrypoint で stdout を `server.log` にリダイレクトしない、(3) logrotate や収集バッチに `server.log` を rename させない、の3点です。恒久策は `server.log` をやめて JSON で stdout へ出すことです（16.8）。
+3. **JBoss 側に必要な対応は「`server.log` を開くのも rename するのも FILE ハンドラ1つだけにすること」です。** 具体的には (1) 同じ `server.log` を指す2つ目のハンドラ／デプロイメント内ログ設定を消す（**EAP 8.1 では、アプリが同梱した reload4j 等の `log4j.xml` はコンテナの設定では止まらないので、アプリ側で出力先を変える**）、(2) entrypoint で stdout を `server.log` にリダイレクトしない、(3) logrotate や収集バッチに `server.log` を rename させない、の3点です。恒久策は `server.log` をやめて JSON で stdout へ出すことです（16.8）。
 
-JBoss が実際に使っているロギングライブラリ（jboss-logmanager 2.1.19.Final、EAP 7.4 系と同じ系列）で再現したところ、原因候補1と原因候補3a が**ご報告の症状と完全に一致**しました。しかも両方とも**前日分のログが消えます**（16.6）。
+**JBoss EAP 8.1 が同梱しているのと同じ jboss-logmanager 2.1.19.Final**（EAP 8.1 → WildFly 35 → WildFly Core 27 の依存定義で確認）で再現したところ、原因候補1（同じ JVM 内の2つ目のハンドラ）、原因候補1b（アプリ同梱の reload4j）、原因候補3a（外部 rename）が**ご報告の症状と完全に一致**しました。しかもいずれも**前日分のログが消えます**（16.6）。
 
 ---
 
@@ -1043,11 +1044,38 @@ JBoss が実際に使っているロギングライブラリ（jboss-logmanager 
 
 | 項目 | 内容 |
 |---|---|
-| 対象 | JBoss EAP の `server.log`（logging サブシステムの `periodic-rotating-file-handler`、`suffix=".yyyy-MM-dd"`） |
+| 対象 | **JBoss EAP 8.1** の `server.log`（logging サブシステムの `periodic-rotating-file-handler`、`suffix=".yyyy-MM-dd"`） |
 | 出力先 | EFS 上の `/<ルート>/<タスクID>/<front または back>/server.log` のように、**タスクとコンテナごとにディレクトリを分けている** |
 | 期待する動き | 0時を過ぎて最初のログが出た瞬間に `server.log` → `server.log.2026-09-18` と rename され、以後は新しい `server.log` に書かれる |
 | 実際の動き | 0時を過ぎた後も **`server.log.2026-09-18` に追記され続け**、`server.log` には書かれない（または、ほとんど書かれない） |
 | アプリログとの違い | アプリログ（Log4j2）はタスクIDディレクトリで解消したが、**`server.log` は解消しない** |
+
+#### 16.1.1 前提とするバージョンと、EAP 8 で変わったこと
+
+**EAP 8.1 のロギングライブラリのバージョン**（2026-09-24 に Maven Central の POM で確認。Red Hat の製品リポジトリはこの検証環境から参照できなかったため、上流の対応関係から特定）
+
+| 層 | バージョン | 根拠 |
+|---|---|---|
+| JBoss EAP | 8.1 | 対象 |
+| 上流の WildFly | 35 | EAP 8.1 は WildFly 35 ベース |
+| WildFly Core | 27.0.x | `wildfly-parent-35.0.0.Final.pom` の `version.org.wildfly.core` = 27.0.0.Final |
+| **jboss-logmanager** | **2.1.19.Final** | `wildfly-core-parent-27.0.x.pom` の `version.org.jboss.logmanager.jboss-logmanager` |
+| wildfly-common | 1.7.0.Final | 同上の `version.org.wildfly.common` |
+
+EAP 8.1 の製品版はこれに `-redhat-NNNNN` が付いたものです。実機では `ls $JBOSS_HOME/modules/system/layers/base/org/jboss/logmanager/main/` で確認できます。
+**回転処理（16.4）は 2.1.19.Final のソースそのもの**で、再現（16.6）もこのバージョンと wildfly-common 1.7.0.Final で実行しています。
+（初版で「EAP 8 は jboss-logmanager 3.x 系」と書いたのは誤りでした。EAP 8.1 は 2.1 系です）
+
+**EAP 8（8.0 以降）で変わった、今回の原因に直結する仕様**（WildFly Core 27 の logging サブシステムのソース `LoggingConfigDeploymentProcessor` / `LoggingModuleDependency` と `standalone.sh` で確認）
+
+| 仕様 | EAP 8.1 での挙動 | 今回への影響 |
+|---|---|---|
+| コンテナが読むデプロイメント内ログ設定 | `META-INF` または `WEB-INF/classes` の **`logging.properties` と `jboss-logging.properties` だけ** | `use-deployment-logging-config=false` で止められるのはこの2つだけ |
+| log4j 1.x | **コンテナが提供しなくなった**。`log4j.xml` / `log4j.properties` / `jboss-log4j.xml` をコンテナは読まない | 旧アプリは reload4j（log4j 1.x 互換）等を **WAR に同梱**して動かすことになる。その場合 **reload4j 自身が `log4j.xml` を読み、自分で `server.log` を開いて rename する**。**コンテナの設定では止まらない**（原因候補1b） |
+| Log4j2 API | コンテナが `org.apache.logging.log4j.api` を自動で追加し、JBoss LogManager に流す | アプリの `log4j2.xml` は通常使われない。**`log4j-core` を同梱し、かつ API モジュールを除外**（`jboss-deployment-structure.xml` か `add-logging-api-dependencies=false`）したときだけ、log4j-core 自身がファイルを開く |
+| SLF4J | コンテナが `org.slf4j` を追加 | logback の `logback.xml` も、logback を同梱し slf4j モジュールを除外したときだけ有効 |
+| 起動時ログ | `standalone.sh` が `-Dorg.jboss.boot.log.file=$JBOSS_LOG_DIR/server.log` を渡し、`logging.properties` の FILE ハンドラが起動直後から書く | subsystem の FILE と**同じハンドラ（同名で引き継がれる）**なので2人目にはならない。ただし `JBOSS_LOG_DIR` と `jboss.server.log.dir` が違うと、起動直後だけ別の場所に書かれる（J6） |
+| インストールマネージャ | `standalone.sh` は JVM が終了コード 20 で終わると `installation-manager.sh` を起動し、同じ `server.log` に書かせる | **JVM が終了した後に順番に**書くので同時オープンにはならない。原因ではない |
 
 ### 16.2 まず確定できること — 推理の出発点
 
@@ -1079,7 +1107,7 @@ JBoss が実際に使っているロギングライブラリ（jboss-logmanager 
 
    タスクIDディレクトリが防ぐもの：タスクA と タスクB が同じファイルを開くこと（＝アプリログで起きていた問題）
    タスクIDディレクトリが防げないもの：
-       ・タスクA の JVM の中で、2つの部品が同じ server.log を開くこと           ← 原因候補1
+       ・タスクA の JVM の中で、2つの部品が同じ server.log を開くこと           ← 原因候補1・1b
        ・タスクA のコンテナの中で、シェルと JVM が同じ server.log を開くこと      ← 原因候補2
        ・誰かが「/logs/<タスクA>/front/server.log」を名指しで rename すること    ← 原因候補3
 ```
@@ -1104,7 +1132,7 @@ JBoss が実際に使っているロギングライブラリ（jboss-logmanager 
 
 ### 16.4 JBoss の回転処理の中身（jboss-logmanager のソースで確認）
 
-JBoss EAP 7.4 系が同梱する jboss-logmanager 2.1 系の `PeriodicRotatingFileHandler` の該当部分です（コメントは本資料で追加）。
+JBoss EAP 8.1 が同梱する jboss-logmanager 2.1.19.Final の `PeriodicRotatingFileHandler` の該当部分です（コメントは本資料で追加）。
 
 ```java
 // ログ1件ごとに、書く前に呼ばれる
@@ -1150,7 +1178,8 @@ Files.move(src, target, StandardCopyOption.REPLACE_EXISTING);   // ★ 移動先
 
 | ID | 犯人 | よくある実例 | 症状の一致度 | 前日分のログ | 判別方法 |
 |---|---|---|---|---|---|
-| **1** | **同じ JVM の中の、FILE 以外のハンドラ／アペンダ** | CLI で追加した別名ハンドラ、`logging-profile`、WAR/EAR 内の `logging.properties`・`jboss-logging.properties`・`log4j.xml`・`log4j2.xml` が `${jboss.server.log.dir}/server.log` を指している | **完全一致**（再現済み） | **毎日消える** | JVM の FD のうち `server.log*` を指すものが**2本以上** |
+| **1** | **同じ JVM の中の、FILE 以外の JBoss ハンドラ** | CLI で追加した別名ハンドラ、`logging-profile`、WAR/EAR 内の `logging.properties`・`jboss-logging.properties` が `${jboss.server.log.dir}/server.log` を指している | **完全一致**（再現済み） | **毎日消える** | JVM の FD のうち `server.log*` を指すものが**2本以上** |
+| **1b** | **アプリが同梱したログライブラリのアペンダ**（EAP 8 で増えた経路） | WAR に reload4j（または log4j 1.2）を同梱し、`log4j.xml` の `DailyRollingFileAppender` が `${jboss.server.log.dir}/server.log` を指している。log4j-core／logback を同梱し API モジュールを除外している場合の `log4j2.xml`／`logback.xml` も同様 | **完全一致**（再現済み） | **毎日消える** | 候補1と同じ（FD が2本以上）。`audit-logging-config.sh` が「有効（reload4j 同梱）」と判定 |
 | **2** | **シェルのリダイレクト**（JVM の stdout/stderr） | entrypoint で `standalone.sh >> server.log 2>&1`、`\| tee -a server.log` | 部分一致（`server.log` 側も伸びる） | 残る | FD **1 / 2** が `server.log*` を指す |
 | **3a** | **外部の rename（JBoss の回転の“後”）** | コンテナ内の logrotate（`/etc/logrotate.d`）、収集用 EC2 の cron、S3 退避バッチが `mv server.log server.log.<日付>` | **完全一致**（再現済み） | **消える** | JVM の FD は1本だけなのに、**日付ファイルを指している** |
 | 3b | 外部の rename（JBoss の回転の“前”） | 同上で、実行が 0:00:00 直後 | 不一致（`server.log` に書かれる） | **消える**（日付ファイルが空になる） | 日付ファイルが空／極端に小さい |
@@ -1167,12 +1196,30 @@ Files.move(src, target, StandardCopyOption.REPLACE_EXISTING);   // ★ 移動先
 - **logging サブシステムに、FILE とは別名で同じ `path="server.log"` を指すハンドラ**がある
   （例：障害調査のために CLI で `periodic-rotating-file-handler=APP_FILE` を追加し、出力先をうっかり `server.log` にした）
 - **`logging-profile`** の中のハンドラが `server.log` を指している
-- **デプロイメント（WAR/EAR）に同梱したログ設定ファイル**が `${jboss.server.log.dir}/server.log` を指している
-  - `WEB-INF/classes/logging.properties`、`META-INF/jboss-logging.properties`
-  - `log4j.xml` / `log4j.properties`（log4j 1.x の `DailyRollingFileAppender`）
-  - `log4j2.xml`（Log4j2 の `RollingFile`）
-  - JBoss は既定で `use-deployment-logging-config=true` なので、これらは**自動で有効**になり、**JBoss の FILE とは別のハンドラ（別の FD）**が作られる
-  - 特に log4j 1.x の `DailyRollingFileAppender` の既定の日付パターンは `'.'yyyy-MM-dd` で、**JBoss と全く同じ `server.log.2026-09-18` という名前**になるため、見分けがつきません
+- **デプロイメント（WAR/EAR）の `META-INF` または `WEB-INF/classes` にある `logging.properties`／`jboss-logging.properties`** が `${jboss.server.log.dir}/server.log` を指している
+  - EAP 8.1 は既定で `use-deployment-logging-config=true` なので、これらは**自動で有効**になり、デプロイメント専用の LogContext に **JBoss の FILE とは別の `PeriodicRotatingFileHandler`（別の FD）**が作られる
+  - EAP 8.1 のコンテナが読むのは**この2つのファイル名だけ**です（16.1.1）
+
+**原因候補1b：アプリが同梱したログライブラリ（EAP 8 で増えた経路）**
+
+EAP 8 ではコンテナが log4j 1.x を提供しなくなりました。そのため、EAP 7 以前から `log4j.xml` を使ってきたアプリを EAP 8 に載せ替えるとき、**reload4j（log4j 1.x 互換）や log4j 1.2 の jar を WAR に同梱**して動かすのが定番の対応になっています。このとき：
+
+- `log4j.xml` を読むのは**コンテナではなく、アプリが同梱した reload4j 自身**です。**`use-deployment-logging-config=false` にしても止まりません。**
+- `log4j.xml` の `DailyRollingFileAppender` が `${jboss.server.log.dir}/server.log` を指していると、reload4j は**自分で `server.log` を開き（2本目の FD）、自分で rename します。**
+- reload4j の `DailyRollingFileAppender` の既定の日付パターンは `'.'yyyy-MM-dd` で、**JBoss と全く同じ `server.log.2026-09-18` という名前**を作ります。
+- reload4j の回転処理（1.2.26 のソース）は JBoss よりさらに乱暴で、**移動先が既にあれば先に削除してから rename** します。
+
+```java
+// reload4j 1.2.26 DailyRollingFileAppender.rollOver()（抜粋）
+this.closeFile();                                   // 自分の FD だけを閉じる
+File target = new File(scheduledFilename);          // 例: server.log.2026-09-18
+if (target.exists()) { target.delete(); }           // ★ JBoss が作った前日分を削除
+file.renameTo(target);                              // ★ JBoss が今開いたばかりの新しい server.log を日付名へ
+this.setFile(fileName, true, ...);                  // server.log を開き直す
+```
+
+- EAP 7 時代は「コンテナが log4j.xml を読む」構成だったものが、EAP 8 への移行で「アプリ同梱ライブラリが読む」構成に変わり、**出力先が `server.log` のまま残っている**、という経緯で入り込みやすい点に注意してください。
+- `log4j2.xml`（`RollingFile`）や `logback.xml` も、log4j-core／logback を同梱し、コンテナのログ API モジュールを除外している場合は同じ構図になります。
 
 **何が起きるか（ミリ秒単位）**
 
@@ -1267,10 +1314,15 @@ rename したのが**別ホスト（別の NFS クライアント）**だと、J
 | front と back コンテナの共有 | ディレクトリで分離済み（同じディレクトリを指していないか、念のため 16.7 の手順で確認） |
 | EFS の性能・スループットモード | rename と create の間の数ミリ秒が変わるだけで、FD の行き先は変わらない |
 | JBoss のバグ | JBoss は「自分の FD を閉じて開き直す」を正しく行っている。**同じファイルを他人と共有する使い方を想定していない**だけ |
+| 起動時ログ（`logging.properties`）の FILE ハンドラ | subsystem の FILE と同名で引き継がれる**同じハンドラ**。FD は1本 |
+| EAP 8 のインストールマネージャ（`standalone.sh` の終了コード 20） | JVM 終了後に順番に `server.log` へ書くだけで、同時には開かない |
+| Undertow のアクセスログ・GC ログ | 出力先が `access_log.log`・`gc.log` で、`server.log` とは別ファイル |
 
 ### 16.6 実物のライブラリでの再現結果
 
-`jboss/repro/ServerLogRotationRepro.java` は、**JBoss EAP が実際に使っている jboss-logmanager の `PeriodicRotatingFileHandler` そのもの**を使い、ログの時刻を 9/18 23:59 → 9/19 0:00 に設定して日付またぎを起こします（`jboss/repro/run_repro.sh` で実行。JBoss 本体は不要）。2026-09-24 に jboss-logmanager 2.1.19.Final で実行した結果の要点です（全文は `jboss/repro/expected_output.txt`）。
+`jboss/repro/ServerLogRotationRepro.java` は、**JBoss EAP が実際に使っている jboss-logmanager の `PeriodicRotatingFileHandler` そのもの**を使い、ログの時刻を 9/18 23:59 → 9/19 0:00 に設定して日付またぎを起こします（`jboss/repro/run_repro.sh` で実行。JBoss 本体は不要）。2026-09-24 に **EAP 8.1 と同じ jboss-logmanager 2.1.19.Final ＋ wildfly-common 1.7.0.Final**（JDK 21）で実行した結果の要点です（全文は `jboss/repro/expected_output.txt`）。
+
+`jboss/repro/MixedLibraryRepro.java`（`run_repro.sh --reload4j`）は、**JBoss の FILE ハンドラとアプリ同梱の reload4j 1.2.26 の `DailyRollingFileAppender` を同じ `server.log` に向けて**、実際に時刻の境界をまたいで動かします（reload4j はログの時刻ではなく実時計で回転を判定するため、両者の周期を「分」にして1分以内で再現します。周期が日でも手順は同じです。全文は `jboss/repro/expected_output_reload4j.txt`）。
 
 | シナリオ | 回転後に FD が指している先 | `server.log` の中身 | `server.log.2026-09-18` の中身 | 判定 |
 |---|---|---|---|---|
@@ -1281,6 +1333,7 @@ rename したのが**別ホスト（別の NFS クライアント）**だと、J
 | S3 外部 rename（JBoss の前） | fd 8 → `server.log` | 9/19 のログ | **空**（9/18 分は**消滅**） | 前日分だけ消える |
 | S4 stdout リダイレクト | fd 8 → `server.log.2026-09-18`（シェルの FD）、fd 9 → `server.log` | FILE の 9/19 分 | 9/18 分 ＋ **CONSOLE の 9/19 分** | 部分一致 |
 | S5 JVM が UTC | fd 8 → `server.log` | JST 9:00 以降 | 9/18 分 ＋ **JST 9/19 0〜9時** | 見かけ上一致 |
+| **S6 JBoss FILE ＋ 同梱 reload4j**（原因候補1b） | fd 10 → **`server.log.<前の期間>`**（JBoss）、fd 11 → `server.log`（reload4j） | reload4j の行だけ | **JBoss FILE の境界後の行**（境界前の行は reload4j の `target.delete()` で**消滅**） | **症状と一致** |
 
 S1 の実際の出力（抜粋）：
 
@@ -1334,11 +1387,12 @@ done
      FD 1 / 2 がある                JVM 内に 2本以上                   1本だけ
          │                              │                               │
          ▼                              ▼                               ▼
-   【原因候補2】                   【原因候補1】             その1本が日付ファイル（または inode 不一致）？
+   【原因候補2】                   【原因候補1／1b】         その1本が日付ファイル（または inode 不一致）？
    entrypoint の                   audit-logging-config.sh           ┌──────────┴──────────┐
-   リダイレクトを外す              で2つ目のハンドラを特定         はい                  いいえ
+   リダイレクトを外す              で2つ目を特定                   はい                  いいえ
                                    （subsystem／profile／             │                     │
-                                     デプロイメント内設定）           ▼                     ▼
+                                     logging.properties →1、          │                     │
+                                     同梱 reload4j 等 →1b）           ▼                     ▼
                                                                【原因候補3】           正常（いまは発生していない）
                                                                logrotate／収集バッチ    → 日付ファイルの中身が 0〜9時なら
                                                                ／別ホストの cron        【原因候補4】タイムゾーン
@@ -1351,20 +1405,21 @@ done
 | # | 対応 | 対象の原因 | 効果 | 工数 | 実装 |
 |---|---|---|---|---|---|
 | J1 | **`server.log` を指すハンドラを FILE 1つだけにする**（2つ目は `app.log` 等へ向け直すか削除） | 候補1 | 根治 | 小 | `jboss/cli/fix-server-log-single-writer.cli` |
-| J2 | **デプロイメント内のログ設定を無効化**（`use-deployment-logging-config=false`）、またはアプリ側の出力先を `server.log` 以外へ変更 | 候補1 | 根治 | 小 | 同上 |
+| J2a | **コンテナが読むデプロイメント内ログ設定を無効化**（`use-deployment-logging-config=false`。対象は `logging.properties`／`jboss-logging.properties` だけ） | 候補1 | 根治 | 小 | 同上 |
+| **J2b** | **アプリ同梱ライブラリの出力先を `server.log` 以外へ変更**（reload4j の `log4j.xml`、log4j-core の `log4j2.xml`、logback の `logback.xml`）。アプリ用のファイルは第9章の案2（DirectWrite ＋ タスクID別パス）で書く | **候補1b** | 根治 | 小（アプリ改修） | アプリの設定ファイル |
 | J3 | **entrypoint で stdout/stderr を `server.log` にリダイレクトしない**（stdout は ECS の awslogs / FireLens へ） | 候補2 | 根治 | 極小 | `jboss/bin/entrypoint.sh` |
 | J4 | **logrotate・収集バッチ・運用手順に `server.log` を触らせない**（触ってよいのは回転済みの `server.log.*` だけ、しかも1日以上前のもの） | 候補3 | 根治 | 小 | 運用手順・cron の修正 |
 | J5 | **`TZ=Asia/Tokyo` と `-Duser.timezone=Asia/Tokyo`** を設定 | 候補4 | 誤認防止 | 極小 | `jboss/bin/entrypoint.sh` |
 | J6 | **`JBOSS_LOG_DIR` と `-Djboss.server.log.dir` を同じにする**（起動時ログと本番ログの出力先をそろえる） | 予防 | 予防 | 極小 | `jboss/bin/entrypoint.sh` |
 | J7 | **監視**：`check-server-log-fd.sh` を日次（0:05 など）で実行し、終了コード 1 でアラート | 全部 | 検知 | 小 | `jboss/bin/check-server-log-fd.sh` |
-| **J8** | **【恒久策】`server.log` をやめ、JSON で stdout に出す**（CONSOLE ハンドラ＋`json-formatter`。EAP 7.1 以降） | 全部 | **根治**（ファイルも rename も無くなる） | 中 | `jboss/cli/server-log-to-stdout.cli` |
+| **J8** | **【恒久策】`server.log` をやめ、JSON で stdout に出す**（CONSOLE ハンドラ＋`json-formatter`。EAP 8.1 の管理モデルに `json-formatter`・`zone-id` があることをソースで確認済み） | 全部 | **根治**（ファイルも rename も無くなる） | 中 | `jboss/cli/server-log-to-stdout.cli` |
 
 **推奨の組み合わせ**
 
 ```
 【すぐやる】 J7（まず診断を実行して犯人を特定）
                  ↓
-【犯人に応じて】 候補1 → J1 ＋ J2 ／ 候補2 → J3 ／ 候補3 → J4
+【犯人に応じて】 候補1 → J1 ＋ J2a ／ 候補1b → J2b ／ 候補2 → J3 ／ 候補3 → J4
                  ＋
 【併用】        J5（タイムゾーン）、J6（ログディレクトリの一致）
                  ＋
@@ -1376,6 +1431,8 @@ done
 | 対策 | 効かない理由 |
 |---|---|
 | タスクIDディレクトリをさらに細かくする | 犯人は同じディレクトリの中にいる（16.3） |
+| `use-deployment-logging-config=false` だけで済ませる | EAP 8.1 でこれが止めるのは `logging.properties`／`jboss-logging.properties` だけ。**アプリ同梱の reload4j 等（候補1b）は止まらない** |
+| `jboss-deployment-structure.xml` で logging サブシステムを除外する | アプリ同梱ライブラリが自分でファイルを開くことは変わらない。むしろ候補1b が有効になる条件になる |
 | `autoflush` を変える | 書き込むタイミングが変わるだけで、FD の行き先は変わらない |
 | `periodic-size-rotating-file-handler` や `size-rotating-file-handler` に替える | 回転の方式（close → rename → create）は同じ。2人目の書き手がいれば同じことが起きる |
 | `suffix` に `.gz` を付ける | 回転時に圧縮してから元ファイルを削除するので、2人目の書き手の FD は**削除済みファイル**（EFS では `.nfs*`）を指すことになり、**もっと悪化**する |
@@ -1388,10 +1445,12 @@ done
 |---|---|
 | `jboss/repro/ServerLogRotationRepro.java` | 実物の jboss-logmanager で原因候補1〜4を再現し、FD と各ファイルの中身を表示する |
 | `jboss/repro/run_repro.sh` | 上記に必要な jar を Maven Central から取得して実行する。引数に EFS 上のパスを渡せば EFS 上で再現できる |
-| `jboss/repro/expected_output.txt` | 2026-09-24 に実行した結果（本章 16.6 の根拠） |
+| `jboss/repro/expected_output.txt` | 2026-09-24 に EAP 8.1 と同じライブラリで実行した結果（本章 16.6 の根拠） |
+| `jboss/repro/MixedLibraryRepro.java` | 原因候補1b：JBoss の FILE とアプリ同梱 reload4j が同じ `server.log` を回転させる様子を、実時計で再現する（`run_repro.sh --reload4j`） |
+| `jboss/repro/expected_output_reload4j.txt` | 上記の実行結果 |
 | `jboss/bin/check-server-log-fd.sh` | **実行時診断**。`/proc/*/fd` を調べ、`server.log*` を指す FD の本数・番号・inode から原因候補を自動判定する（終了コード 0=正常 / 1=異常） |
-| `jboss/bin/audit-logging-config.sh` | **静的点検**。`standalone.xml`（logging-profile 含む）・`logging.properties`・デプロイメント内のログ設定・logrotate/cron・entrypoint を横断し、`server.log` を開く／rename する主体を列挙する |
-| `jboss/cli/fix-server-log-single-writer.cli` | J1・J2：FILE を唯一の `server.log` ハンドラにし、2つ目を別ファイルへ向け直し、デプロイメント内ログ設定を無効化する |
+| `jboss/bin/audit-logging-config.sh` | **静的点検**。`standalone.xml`（logging-profile 含む）・`logging.properties`・デプロイメント内のログ設定・logrotate/cron・entrypoint を横断し、`server.log` を開く／rename する主体を列挙する。デプロイメント内の設定は EAP 8.1 の仕様に合わせて「コンテナが読む（a）／同梱 reload4j が読む（b）／同梱 log4j-core が読む（c）／同梱 logback が読む（d）／無視される（e）」に分類し、同梱 jar と `jboss-deployment-structure.xml` の除外設定から**実際に有効かどうか**を判定する |
+| `jboss/cli/fix-server-log-single-writer.cli` | J1・J2a：FILE を唯一の `server.log` ハンドラにし、2つ目を別ファイルへ向け直し、デプロイメント内ログ設定を無効化する |
 | `jboss/cli/server-log-to-stdout.cli` | J8：`server.log` をやめて JSON で stdout に出す |
 | `jboss/bin/entrypoint.sh` | J3・J5・J6：タスクID／コンテナ名のディレクトリを作り、リダイレクトせずに `exec standalone.sh` する |
 
@@ -1433,7 +1492,8 @@ exec "$JBOSS_HOME/bin/standalone.sh" -b 0.0.0.0 -Djboss.server.log.dir="$JBOSS_L
 
 別の部屋から来た人がいたわけではないので、**部屋を分けても防げません**。直し方は「**1冊のノートの整理券を持てるのは1人だけ、シールを貼り替えてよいのもその1人だけ**」と決めることです。
 
-- ふたごには別のノート（`app.log`）を渡す（J1・J2）
+- ふたごには別のノート（`app.log`）を渡す（J1・J2a）
+- EAP 8 からは、**よその学校から来た転校生**（アプリが持ち込んだ reload4j）も同じ部屋にいることがあります。転校生は先生（コンテナ）の言うことを聞かないので、**転校生本人に「たろうのノートは使わないで」と伝える**必要があります（J2b）
 - 部屋の入口で「ノートにも同じことを書いておいて」と頼む係（シェルのリダイレクト）をやめる（J3）
 - 夜中にシールを勝手に貼り替えにくる用務員さん（logrotate・収集バッチ）に、「たろうのノート」には触らないでもらう（J4）
 
@@ -1447,7 +1507,9 @@ exec "$JBOSS_HOME/bin/standalone.sh" -b 0.0.0.0 -Djboss.server.log.dir="$JBOSS_L
 - [ ] FD が1本だけで日付ファイル（または inode 不一致）を指していないか（指していれば原因候補3）
 - [ ] `server.log.<日付>` の**最初の行の日付**が、ファイル名の日付と一致しているか（1日ずれていれば前日分が消えている）
 - [ ] `standalone.xml` と logging-profile に、`server.log` を指すハンドラが FILE 以外にないか
-- [ ] WAR/EAR に `logging.properties`・`jboss-logging.properties`・`log4j.xml`・`log4j2.xml` が同梱されていないか、同梱されていれば `server.log` を指していないか
+- [ ] WAR/EAR の `META-INF`／`WEB-INF/classes` に `logging.properties`・`jboss-logging.properties` がないか、あれば `server.log` を指していないか（原因候補1）
+- [ ] WAR/EAR に reload4j／log4j 1.2 の jar が同梱されていないか、同梱されていれば `log4j.xml`／`log4j.properties` の出力先が `server.log` になっていないか（原因候補1b。**EAP 7 から移行したアプリは特に注意**）
+- [ ] log4j-core／logback を同梱し、`jboss-deployment-structure.xml` でコンテナのログ API モジュールを除外していないか。していれば `log4j2.xml`／`logback.xml` の出力先を確認（原因候補1b）
 - [ ] コンテナ内の `/etc/logrotate.d`・cron、収集用 EC2 の cron、運用手順に `server.log` の rename が無いか
 - [ ] entrypoint に `>> server.log` や `| tee` が無いか
 - [ ] コンテナの `date` と JVM の `user.timezone` が JST か
@@ -1462,11 +1524,13 @@ exec "$JBOSS_HOME/bin/standalone.sh" -b 0.0.0.0 -Djboss.server.log.dir="$JBOSS_L
 
 ### 16.12 要確認事項
 
-1. **jboss-logmanager のバージョン**：本章は EAP 7.4 系と同じ 2.1 系（2.1.19.Final）のソースと実行結果に基づきます。EAP 7.0〜7.3（2.0 系）・EAP 8（3.x 系）も回転の手順（close → move → open）は同じ設計ですが、実環境のバージョンで `run_repro.sh` の `LOGMANAGER_VERSION` を合わせて確認してください。EAP 6 系（1.5 系）は `File.renameTo` を使いますが、Linux では移動先を上書きする点は同じです。
+1. **jboss-logmanager のバージョン**：本章は EAP 8.1 と同じ 2.1.19.Final（EAP 8.1 → WildFly 35 → WildFly Core 27 の上流 POM で特定）のソースと実行結果に基づきます。Red Hat の製品リポジトリとカスタマーポータル（コンポーネント一覧）はこの検証環境から参照できなかったため、**実機の `$JBOSS_HOME/modules/system/layers/base/org/jboss/logmanager/main/` の jar 名で最終確認**してください。累積パッチ（8.1.x）で差し替わっていた場合は、`LOGMANAGER_VERSION=<版> ./run_repro.sh` で同じ結果になるかを確認できます。
 2. **ハンドラの呼び出し順**：同じロガーに複数ハンドラがある場合の順序は登録順です。どちらが日付ファイルに書き続けるかは順序で変わりますが、症状の形（片方が日付ファイル、前日分が消える）は変わりません。
-3. **`/deployment=*/subsystem=logging/configuration=*`**（`audit-logging-config.sh --cli` で使用）は EAP 7 系の実行時リソースです。EAP 6 系では存在しないため、静的点検（アーカイブの中身の点検）で代替してください。
+3. **`/deployment=*/subsystem=logging/configuration=*`**（`audit-logging-config.sh --cli` で使用）は、WildFly Core 27 のソース（`LoggingDeploymentResources`）で EAP 8.1 に存在することを確認済みの実行時リソースです。これが見えるのは原因候補1（コンテナが読む `logging.properties`）だけで、**原因候補1b（アプリ同梱の reload4j 等）は管理モデルに現れません**。静的点検（アーカイブの中身の点検）と FD の点検で確認してください。
 4. **別ホストからの rename** のとき `/proc/<pid>/fd` の表示名が更新されるかどうかは、NFS クライアントのキャッシュ状態に依存します。**inode 番号での比較**を正としてください。
 5. **ECS のコンテナ間 PID 名前空間**：タスク定義で `pidMode: task` を設定していない場合、サイドカーコンテナが `server.log` を開いていても、JBoss コンテナの中からは見えません。サイドカー（Fluent Bit 等）がある場合は、そのコンテナの中でも `check-server-log-fd.sh` を実行してください（読むだけなら無害です）。
+6. **EAP 8.1 のコンテナイメージの起動スクリプト**：Red Hat 提供の EAP 8.1 イメージ（OpenShift 向けランタイムイメージ等）を ECS で使っている場合、起動スクリプトが標準出力をどう扱うかを確認してください（`audit-logging-config.sh <起動スクリプトのパス>` でリダイレクトの有無を点検できます）。ZIP 版から自作したイメージなら `jboss/bin/entrypoint.sh` の方式で問題ありません。
+7. **EAR の `jboss-deployment-structure.xml`**：除外設定が `<deployment>` と `<sub-deployment>` のどちらに書かれているかで効く範囲が変わります。`audit-logging-config.sh` はどちらかに除外があれば「有効の可能性あり」と判定するので、該当した場合は中身を目で確認してください。
 
 ---
 

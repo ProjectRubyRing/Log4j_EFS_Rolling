@@ -100,44 +100,130 @@ else
 fi
 
 # -------------------------------------------------------------------------------------------
-# 3. デプロイメント内のログ設定（per-deployment logging）
+# 3. デプロイメント内のログ設定（EAP 8.1 の扱いに合わせて「誰が読むか」で分類する）
+#
+#   (a) logging.properties / jboss-logging.properties（META-INF か WEB-INF/classes）
+#       … コンテナ（logging サブシステム）が読み、デプロイメント専用の LogContext を作る。
+#         use-deployment-logging-config=false で無効化できる。
+#   (b) log4j.xml / log4j.properties … EAP 8 からコンテナは読まない（log4j 1.x の提供が廃止）。
+#         アプリが reload4j / log4j 1.2 の jar を同梱していれば、そのライブラリ自身が読み、
+#         DailyRollingFileAppender 等が自分で server.log を開いて rename する。
+#         ★ use-deployment-logging-config では止まらない。
+#   (c) log4j2*.xml … コンテナは log4j-api を JBoss LogManager に流すため通常は使われない。
+#         アプリが log4j-core を同梱し、org.apache.logging.log4j.api モジュールを除外している
+#         （jboss-deployment-structure.xml か add-logging-api-dependencies=false）場合だけ有効。
+#   (d) logback*.xml … (c) と同様。logback-classic 同梱かつ org.slf4j 系モジュールを除外している場合だけ有効。
+#   (e) jboss-log4j.xml … EAP 8 では無視される。
 # -------------------------------------------------------------------------------------------
 hdr "3. デプロイメント内のログ設定ファイル（$DEPLOY_DIR）"
 CONF_RE='(^|/)(logging\.properties|jboss-logging\.properties|log4j\.xml|jboss-log4j\.xml|log4j\.properties|log4j2[^/]*\.(xml|json|ya?ml|properties)|logback[^/]*\.xml)$'
+REF_RE="${LOG_BASENAME}|jboss\.server\.log\.dir"
+USE_DEPLOY=true
+ADD_API=true
+if [ -r "$JBOSS_CONFIG" ]; then
+  grep -q 'use-deployment-logging-config="false"' "$JBOSS_CONFIG" && USE_DEPLOY=false
+  grep -q 'add-logging-api-dependencies="false"' "$JBOSS_CONFIG" && ADD_API=false
+fi
+
+# $1 = 表示名, $2 = エントリ名, $3 = 同梱 jar・除外設定の一覧（改行区切り）, $4 = 参照あり(1)/なし(0)
+judge_entry() {
+  name=$1; e=$2; libs=$3; hit=$4
+  case "$e" in
+    META-INF/logging.properties|META-INF/jboss-logging.properties|WEB-INF/classes/logging.properties|WEB-INF/classes/jboss-logging.properties)
+      kind="(a) コンテナが読む設定"
+      if [ "$USE_DEPLOY" = true ]; then eff="有効（use-deployment-logging-config=true）"; else eff="無効（use-deployment-logging-config=false）"; fi ;;
+    */jboss-log4j.xml|jboss-log4j.xml)
+      kind="(e) EAP 8 では無視"; eff="無効" ;;
+    *log4j.xml|*log4j.properties)
+      kind="(b) アプリ同梱の log4j 1.x 系が読む設定"
+      if echo "$libs" | grep -qE '(^|/)(reload4j[^/]*|log4j-1\.[^/]*|log4j)\.jar$'; then
+        eff="有効（reload4j / log4j 1.2 を同梱）★use-deployment-logging-config では止まらない"
+      else
+        eff="無効の見込み（log4j 1.x の jar を同梱していない。EAP 8 はコンテナから提供しない）"
+      fi ;;
+    *log4j2*)
+      kind="(c) アプリ同梱の log4j-core が読む設定"
+      if echo "$libs" | grep -qE '(^|/)log4j-core[^/]*\.jar$' && { [ "$ADD_API" = false ] || echo "$libs" | grep -q 'EXCLUDE:org.apache.logging.log4j.api'; }; then
+        eff="有効（log4j-core 同梱＋API モジュール除外）"
+      elif echo "$libs" | grep -qE '(^|/)log4j-core[^/]*\.jar$'; then
+        eff="無効の見込み（log4j-core は同梱だが、API はコンテナの JBoss LogManager 経由になる）"
+      else
+        eff="無効の見込み（log4j-core を同梱していない）"
+      fi ;;
+    *logback*)
+      kind="(d) アプリ同梱の logback が読む設定"
+      if echo "$libs" | grep -qE '(^|/)logback-classic[^/]*\.jar$' && { [ "$ADD_API" = false ] || echo "$libs" | grep -q 'EXCLUDE:org.slf4j'; }; then
+        eff="有効（logback-classic 同梱＋slf4j モジュール除外）"
+      else
+        eff="無効の見込み"
+      fi ;;
+    *)
+      kind="(a?) 場所が標準外の logging.properties 等"; eff="無効の見込み（META-INF / WEB-INF/classes 以外はコンテナが読まない）" ;;
+  esac
+  if [ "$hit" = 1 ]; then
+    case "$eff" in
+      有効*) warn "$name!/$e … ${kind}・${eff}。${LOG_BASENAME} を参照しています → 原因候補1（JBoss の FILE とは別の FD で同じファイルを開き、独自に rename する）。出力先を ${LOG_BASENAME} 以外へ変えてください。" ;;
+      *)     info "$name!/$e … ${kind}・${eff}。ただし ${LOG_BASENAME} を参照しているので、将来有効になったときに備えて出力先を変えることを推奨" ;;
+    esac
+  else
+    info "$name!/$e … ${kind}・${eff}（${LOG_BASENAME} への参照なし）"
+  fi
+}
+
+# jboss-deployment-structure.xml の <exclusions> にあるモジュール名を "EXCLUDE:<名前>" として返す
+exclusions_of() {
+  sed -n '/<exclusions>/,/<\/exclusions>/p' | grep -o 'name="[^"]*"' | sed 's/name="\(.*\)"/EXCLUDE:\1/'
+}
+
 scan_archive() {
-  # $1 = アーカイブ, $2 = 表示用の名前
+  # $1 = アーカイブ, $2 = 表示用の名前, $3 = 親アーカイブの同梱 jar 一覧（EAR の lib 等）
   command -v unzip >/dev/null 2>&1 || { info "unzip が無いため $2 の中身を点検できません"; return; }
-  unzip -Z1 "$1" 2>/dev/null | grep -E "$CONF_RE" | while read -r e; do
-    if unzip -p "$1" "$e" 2>/dev/null | grep -nE "${LOG_BASENAME}|jboss\.server\.log\.dir" >/dev/null; then
-      warn "$2!/$e が ${LOG_BASENAME} または jboss.server.log.dir を参照しています → 原因候補1（JBoss の FILE とは別のハンドラ／アペンダが同じファイルを開き、しかも独自に rename します）"
-      unzip -p "$1" "$e" | grep -nE "${LOG_BASENAME}|jboss\.server\.log\.dir" | sed 's/^/        /'
+  entries=$(unzip -Z1 "$1" 2>/dev/null)
+  libs=$(printf '%s\n%s\n' "${3:-}" "$(echo "$entries" | grep -E '\.jar$')")
+  dsx=$(echo "$entries" | grep -E '(^|/)jboss-deployment-structure\.xml$' | head -1)
+  [ -n "$dsx" ] && libs=$(printf '%s\n%s\n' "$libs" "$(unzip -p "$1" "$dsx" | exclusions_of)")
+  echo "$entries" | grep -E "$CONF_RE" | while read -r e; do
+    if unzip -p "$1" "$e" 2>/dev/null | grep -qE "$REF_RE"; then
+      judge_entry "$2" "$e" "$libs" 1
+      unzip -p "$1" "$e" | grep -nE "$REF_RE" | sed 's/^/        /'
     else
-      info "$2!/$e（${LOG_BASENAME} への参照なし）"
+      judge_entry "$2" "$e" "$libs" 0
     fi
   done
-  # EAR の中の WAR を1階層だけ展開して点検
-  unzip -Z1 "$1" 2>/dev/null | grep -E '\.(war|jar)$' | while read -r inner; do
+  # EAR の中の WAR / EJB jar を1階層だけ展開して点検（WEB-INF/lib の jar には潜らない）
+  echo "$entries" | grep -E '\.(war|jar)$' | grep -vE '(^|/)(lib|WEB-INF/lib)/' | while read -r inner; do
     t=$(mktemp)
-    unzip -p "$1" "$inner" > "$t" 2>/dev/null && scan_archive "$t" "$2!/$inner"
+    unzip -p "$1" "$inner" > "$t" 2>/dev/null && scan_archive "$t" "$2!/$inner" "$libs"
     rm -f "$t"
   done
 }
+
+scan_exploded() {
+  # $1 = 展開済みディレクトリ
+  entries=$(cd "$1" && find . -type f | sed 's#^\./##')
+  libs=$(echo "$entries" | grep -E '\.jar$')
+  dsx=$(echo "$entries" | grep -E '(^|/)jboss-deployment-structure\.xml$' | head -1)
+  [ -n "$dsx" ] && libs=$(printf '%s\n%s\n' "$libs" "$(exclusions_of < "$1/$dsx")")
+  echo "$entries" | grep -E "$CONF_RE" | while read -r e; do
+    if grep -qE "$REF_RE" "$1/$e"; then
+      judge_entry "${1##*/}" "$e" "$libs" 1
+      grep -nE "$REF_RE" "$1/$e" | sed 's/^/        /'
+    else
+      judge_entry "${1##*/}" "$e" "$libs" 0
+    fi
+  done
+}
+
+info "use-deployment-logging-config=${USE_DEPLOY} / add-logging-api-dependencies=${ADD_API}"
 if [ -d "$DEPLOY_DIR" ]; then
   for d in "$DEPLOY_DIR"/*; do
     [ -e "$d" ] || continue
     case "$d" in
       *.war|*.ear|*.jar)
         if [ -d "$d" ]; then
-          # 展開済みデプロイメント
-          find "$d" -type f | grep -E "$CONF_RE" | while read -r f; do
-            if grep -qE "${LOG_BASENAME}|jboss\.server\.log\.dir" "$f"; then
-              warn "$f が ${LOG_BASENAME} または jboss.server.log.dir を参照しています → 原因候補1"
-            else
-              info "$f（${LOG_BASENAME} への参照なし）"
-            fi
-          done
+          scan_exploded "$d"
         else
-          scan_archive "$d" "${d##*/}"
+          scan_archive "$d" "${d##*/}" ""
         fi
         ;;
     esac

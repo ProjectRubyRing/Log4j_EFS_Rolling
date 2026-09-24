@@ -38,12 +38,19 @@ if (outcome == success) of /subsystem=logging/logging-profile=app/periodic-rotat
 end-if
 
 # ---------------------------------------------------------------------------------------------
-# 3) デプロイメント（WAR/EAR）に同梱された logging.properties / log4j.xml / log4j2.xml 等を無視させる
-#    これらが ${jboss.server.log.dir}/server.log を指していると、JBoss の FILE とは別の FD で
-#    server.log を開き、しかも独自に rename する（log4j 1.x DailyRollingFileAppender の既定サフィックスは
-#    '.'yyyy-MM-dd なので、JBoss と全く同じ server.log.YYYY-MM-DD という名前になる）。
-#    ★ アプリが自前のログ設定に依存している場合は、この設定ではなく、アプリ側の出力先を
-#      server.log 以外（app.log 等）へ変える方を選んでください。
+# 3) デプロイメント（WAR/EAR）の META-INF / WEB-INF/classes にある logging.properties・
+#    jboss-logging.properties をコンテナに読ませない（EAP 8.1 でコンテナが読むのはこの2つだけ）。
+#    これらが ${jboss.server.log.dir}/server.log を指していると、デプロイメント専用の LogContext に
+#    JBoss の FILE とは別の PeriodicRotatingFileHandler が作られ、別の FD で server.log を開いて独自に rename する。
+#
+#    ★ この設定では止まらないもの（アプリ側の修正が必要）：
+#      - WAR に reload4j / log4j 1.2 を同梱し、log4j.xml / log4j.properties で server.log を指している
+#        （EAP 8 はコンテナが log4j 1.x を提供しないため、アプリのライブラリ自身が設定を読み、
+#         DailyRollingFileAppender が server.log を開いて rename する。既定の日付パターン '.'yyyy-MM-dd は
+#         JBoss と全く同じ server.log.YYYY-MM-DD という名前になる）
+#      - log4j-core / logback を同梱し、コンテナのログ API モジュールを除外している場合の log4j2.xml / logback.xml
+#      → いずれもアプリ側の出力先を server.log 以外（app.log 等）に変えること。audit-logging-config.sh が判定する。
+#    ★ アプリが logging.properties に依存している場合も、この設定ではなく出力先の変更を選ぶ。
 # ---------------------------------------------------------------------------------------------
 /subsystem=logging:write-attribute(name=use-deployment-logging-config, value=false)
 

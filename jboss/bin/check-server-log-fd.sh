@@ -12,7 +12,7 @@
 #
 #   判定の考え方:
 #     FD は「ファイル名」ではなく inode に結びつく。server.log を開いている FD が
-#       - 同じ JVM の中に2本以上ある                → 原因候補1（同一JVM内の複数ハンドラ）
+#       - 同じ JVM の中に2本以上ある                → 原因候補1／1b（同一JVM内の複数ハンドラ／同梱ライブラリ）
 #       - FD 番号 1/2（stdout/stderr）である        → 原因候補2（シェルのリダイレクト）
 #       - JVM 以外のプロセス（tee 等）が持っている   → 原因候補2の変形
 #       - 1本だけだが server.log.<日付> を指している → 原因候補3（外部からの rename）
@@ -80,7 +80,7 @@ MULTI=$(awk -F'\t' '$3!=1 && $3!=2 {n[$1]++; c[$1]=$2} END {for (p in n) if (n[p
 if [ -n "$MULTI" ]; then
   echo "$MULTI" |
   while IFS="$(printf '\t')" read -r pid comm n; do
-    say "原因候補1" "PID $pid ($comm) が ${BASE}* を ${n} 本の FD で開いています。同じ JVM の中に ${BASE} を指すハンドラが複数あります（subsystem の別名ハンドラ／logging-profile／デプロイメント内の logging.properties・log4j.xml・log4j2.xml など）。audit-logging-config.sh で特定してください。"
+    say "原因候補1" "PID $pid ($comm) が ${BASE}* を ${n} 本の FD で開いています。同じ JVM の中に ${BASE} を開く書き手が複数あります（原因候補1：subsystem の別名ハンドラ／logging-profile／デプロイメント内の logging.properties・jboss-logging.properties、原因候補1b：アプリが同梱した reload4j の log4j.xml や log4j-core・logback の設定）。audit-logging-config.sh で特定してください。"
   done
   NG=1
 fi

@@ -1,7 +1,7 @@
 # server-log-to-stdout.cli
 #   【恒久対策】server.log というファイル自体をやめ、JSON で stdout に出す。
 #   stdout は ECS の awslogs / FireLens(Fluent Bit) が拾うので、ファイルも FD も rename も存在しなくなる。
-#   （本資料 9.1 の「案1」を JBoss に適用したもの。EAP 7.1 以降の json-formatter を使用）
+#   （本資料 9.1 の「案1」を JBoss に適用したもの。json-formatter の zone-id 等は EAP 8.1＝WildFly Core 27 のソースで確認済み）
 #
 #     $JBOSS_HOME/bin/jboss-cli.sh --file=server-log-to-stdout.cli
 

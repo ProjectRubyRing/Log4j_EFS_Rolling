@@ -8,10 +8,10 @@ S0_baseline : 正常系：server.log を開くのは FILE ハンドラ1つだけ
     ※ FILE ハンドラ自身は getFile()=server.log に書いているつもり
 
   ■ ディレクトリの状態と中身
-    server.log  (inode 476049, 156 bytes)
+    server.log  (inode 476182, 156 bytes)
         FILE     | 2026-09-19 00:00:10 日付またぎ後のログ(1件目) ← ここで回転
         FILE     | 2026-09-19 00:00:40 日付またぎ後のログ(2件目)
-    server.log.2026-09-18  (inode 476048, 59 bytes)
+    server.log.2026-09-18  (inode 476170, 59 bytes)
         FILE     | 2026-09-18 23:59:50 日付またぎ前のログ
 
 ==========================================================================
@@ -25,11 +25,11 @@ S1_two_handlers_same_file : 原因候補1：同一JVM内に server.log を開く
     ※ APP_FILE ハンドラ自身は getFile()=server.log に書いているつもり
 
   ■ ディレクトリの状態と中身
-    server.log  (inode 476051, 217 bytes)
+    server.log  (inode 476190, 217 bytes)
         APP_FILE | 2026-09-19 00:00:10 9/19 最初のログ ← ここで FILE が回転し、直後に APP_FILE も回転
         APP_FILE | 2026-09-19 00:00:40 9/19 2件目のログ
         APP_FILE | 2026-09-19 12:00:00 9/19 昼のログ
-    server.log.2026-09-18  (inode 476052, 217 bytes)
+    server.log.2026-09-18  (inode 476191, 217 bytes)
         FILE     | 2026-09-19 00:00:10 9/19 最初のログ ← ここで FILE が回転し、直後に APP_FILE も回転
         FILE     | 2026-09-19 00:00:40 9/19 2件目のログ
         FILE     | 2026-09-19 12:00:00 9/19 昼のログ
@@ -43,14 +43,14 @@ S1_two_handlers_same_file : 原因候補1：同一JVM内に server.log を開く
     ※ APP_FILE ハンドラ自身は getFile()=server.log に書いているつもり
 
   ■ ディレクトリの状態と中身
-    server.log  (inode 476051, 150 bytes)
+    server.log  (inode 476190, 150 bytes)
         APP_FILE | 2026-09-20 00:00:10 9/20 最初のログ ← 再び FILE → APP_FILE の順に回転
         APP_FILE | 2026-09-20 00:00:40 9/20 2件目のログ
-    server.log.2026-09-18  (inode 476052, 217 bytes)
+    server.log.2026-09-18  (inode 476191, 217 bytes)
         FILE     | 2026-09-19 00:00:10 9/19 最初のログ ← ここで FILE が回転し、直後に APP_FILE も回転
         FILE     | 2026-09-19 00:00:40 9/19 2件目のログ
         FILE     | 2026-09-19 12:00:00 9/19 昼のログ
-    server.log.2026-09-19  (inode 476053, 150 bytes)
+    server.log.2026-09-19  (inode 476192, 150 bytes)
         FILE     | 2026-09-20 00:00:10 9/20 最初のログ ← 再び FILE → APP_FILE の順に回転
         FILE     | 2026-09-20 00:00:40 9/20 2件目のログ
 
@@ -64,9 +64,9 @@ S2_external_rename_after_jboss : 原因候補3a：JBoss が回転した直後に
     ※ FILE ハンドラ自身は getFile()=server.log に書いているつもり
 
   ■ ディレクトリの状態と中身
-    server.log  (inode 476055, 0 bytes)
+    server.log  (inode 476194, 0 bytes)
         （空）
-    server.log.2026-09-18  (inode 476056, 184 bytes)
+    server.log.2026-09-18  (inode 476195, 184 bytes)
         FILE     | 2026-09-19 00:00:10 9/19 最初のログ ← ここで JBoss が回転
         FILE     | 2026-09-19 00:00:40 9/19 2件目のログ
         FILE     | 2026-09-19 12:00:00 9/19 昼のログ
@@ -81,10 +81,10 @@ S3_external_rename_before_jboss : 原因候補3b：JBoss が回転する前（�
     ※ FILE ハンドラ自身は getFile()=server.log に書いているつもり
 
   ■ ディレクトリの状態と中身
-    server.log  (inode 476058, 201 bytes)
+    server.log  (inode 476197, 201 bytes)
         FILE     | 2026-09-19 00:00:10 9/19 最初のログ ← ここで JBoss が回転（外部が作った空の server.log を日付名へ上書き）
         FILE     | 2026-09-19 00:00:40 9/19 2件目のログ
-    server.log.2026-09-18  (inode 476059, 0 bytes)
+    server.log.2026-09-18  (inode 476198, 0 bytes)
         （空）
 
 ==========================================================================
@@ -97,10 +97,10 @@ S4_stdout_redirect : 原因候補2：JVM の stdout を server.log へリダイ�
     ※ FILE ハンドラ自身は getFile()=server.log に書いているつもり
 
   ■ ディレクトリの状態と中身
-    server.log  (inode 476062, 136 bytes)
+    server.log  (inode 476201, 136 bytes)
         FILE     | 2026-09-19 00:00:10 9/19 最初のログ ← FILE だけが回転する
         FILE     | 2026-09-19 00:00:40 9/19 2件目のログ
-    server.log.2026-09-18  (inode 476061, 209 bytes)
+    server.log.2026-09-18  (inode 476200, 209 bytes)
         FILE     | 2026-09-18 23:59:50 9/18 最後のログ
         CONSOLE  | 2026-09-18 23:59:50 9/18 最後のログ
         CONSOLE  | 2026-09-19 00:00:10 9/19 最初のログ
@@ -115,9 +115,9 @@ S5_timezone_utc : 原因候補4（見かけ上の類似）：JVM が UTC のま�
     ※ FILE ハンドラ自身は getFile()=server.log に書いているつもり
 
   ■ ディレクトリの状態と中身
-    server.log  (inode 476065, 100 bytes)
+    server.log  (inode 476204, 100 bytes)
         FILE     | 2026-09-19 09:00:10 JST 9/19 09:00:10（UTC で日付が変わる → ここで回転）
-    server.log.2026-09-18  (inode 476064, 198 bytes)
+    server.log.2026-09-18  (inode 476203, 198 bytes)
         FILE     | 2026-09-18 23:59:50 JST 9/18 23:59:50
         FILE     | 2026-09-19 00:00:10 JST 9/19 00:00:10（UTC ではまだ 9/18 15:00。回転しない）
         FILE     | 2026-09-19 08:59:50 JST 9/19 08:59:50

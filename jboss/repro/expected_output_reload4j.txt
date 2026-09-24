@@ -1,0 +1,26 @@
+==========================================================================
+S6_jboss_and_reload4j : 原因候補1b：JBoss の FILE と、アプリ同梱 reload4j の DailyRollingFileAppender が同じ server.log を使う
+==========================================================================
+  分の境界の直前まで 41 秒待ちます…
+
+  ■ この JVM が開いている FD（/proc/self/fd）
+    fd 10 -> server.log.2026-09-24-06-49
+    fd 11 -> server.log
+    ※ JBoss の FILE も reload4j も「server.log に書いているつもり」
+
+  ■ ディレクトリの状態と中身
+    server.log  (181 bytes)
+        RELOAD4J | 06:50:00 ログ 6 件目
+        RELOAD4J | 06:50:01 ログ 7 件目
+        RELOAD4J | 06:50:02 ログ 8 件目
+        RELOAD4J | 06:50:03 ログ 9 件目
+        RELOAD4J | 06:50:04 ログ 10 件目
+    server.log.2026-09-24-06-49  (181 bytes)
+        FILE     | 06:50:00 ログ 6 件目
+        FILE     | 06:50:01 ログ 7 件目
+        FILE     | 06:50:02 ログ 8 件目
+        FILE     | 06:50:03 ログ 9 件目
+        FILE     | 06:50:04 ログ 10 件目
+
+  期待される結果：境界より前の行（前の分）は消え、JBoss の FILE は境界後もずっと
+  server.log.<前の分> に書き続け、server.log には RELOAD4J の行だけが入る。
